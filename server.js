@@ -82,6 +82,9 @@ app.get("/", (req, res) => {
 
 // Voice start
 app.post("/voice", async (req, res) => {
+  console.log("Twilio To:", req.body.To);
+  console.log("Twilio From:", req.body.From);
+  
   const toNumber = req.body.To;
 
   const business = await getBusinessByPhone(toNumber);
