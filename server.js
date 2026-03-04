@@ -1,37 +1,40 @@
 require("dotenv").config();
+
 const express = require("express");
 const { createClient } = require("@supabase/supabase-js");
 const OpenAI = require("openai");
-const twilio = require("twilio");
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
-
-// ===== Clients =====
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY
 );
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ===== Helper: Find Business =====
-async function getBusinessByNumber(twilioNumber) {
-  const { data } = await supabase
+/* ===============================
+   HELPERS
+================================= */
+
+async function getBusinessByPhoneNumber(twilioToNumber) {
+  const { data, error } = await supabase
     .from("businesses")
     .select("*")
-    .eq("twilio_number", twilioNumber)
-    .single();
+    .eq("phone_number", twilioToNumber)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.error("Business lookup error:", error.message);
+    return null;
+  }
 
   return data;
 }
 
-// ===== Store Conversation =====
 async function storeConversation(
   businessId,
   userPhone,
@@ -40,7 +43,7 @@ async function storeConversation(
   message,
   callSid = null
 ) {
-  await supabase.from("conversations").insert([
+  const { error } = await supabase.from("conversations").insert([
     {
       business_id: businessId,
       user_phone: userPhone,
@@ -50,41 +53,43 @@ async function storeConversation(
       call_sid: callSid,
     },
   ]);
+
+  if (error) console.error("Store conversation error:", error.message);
 }
 
-// ===== Voice History (Session-Based) =====
+// Voice memory: session-only (CallSid)
 async function getVoiceHistory(businessId, callSid) {
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("conversations")
     .select("role, message")
     .eq("business_id", businessId)
     .eq("call_sid", callSid)
     .order("created_at", { ascending: true });
 
+  if (error) console.error("Voice history error:", error.message);
+
   return data || [];
 }
 
-// ===== SMS History (Persistent) =====
-async function getSMSHistory(businessId, phone) {
-  const { data } = await supabase
+// SMS memory: persistent (phone)
+async function getSmsHistory(businessId, userPhone) {
+  const { data, error } = await supabase
     .from("conversations")
     .select("role, message")
     .eq("business_id", businessId)
-    .eq("user_phone", phone)
+    .eq("user_phone", userPhone)
     .order("created_at", { ascending: true })
     .limit(15);
+
+  if (error) console.error("SMS history error:", error.message);
 
   return data || [];
 }
 
-// ===== Generate AI Reply =====
 async function generateAIReply(systemPrompt, history, userInput) {
-  const cleanedHistory = history
-    .filter((msg) => msg.role && msg.message)
-    .map((msg) => ({
-      role: msg.role,
-      content: msg.message,
-    }));
+  const cleanedHistory = (history || [])
+    .filter((m) => m && m.role && m.message)
+    .map((m) => ({ role: m.role, content: m.message }));
 
   const messages = [
     { role: "system", content: systemPrompt },
@@ -100,55 +105,70 @@ async function generateAIReply(systemPrompt, history, userInput) {
   return completion.choices[0].message.content;
 }
 
-// ===== VOICE ENTRY =====
+/* ===============================
+   ROUTES
+================================= */
+
+app.get("/", (req, res) => {
+  res.send("Ebi SaaS backend is running");
+});
+
+// VOICE ENTRY
 app.post("/voice", async (req, res) => {
   const toNumber = req.body.To;
-  const business = await getBusinessByNumber(toNumber);
+
+  console.log("VOICE /voice To:", toNumber); // helpful debug
+
+  const business = await getBusinessByPhoneNumber(toNumber);
 
   if (!business) {
-    return res.send(`
-      <Response>
-        <Say>Sorry, this number is not configured.</Say>
-      </Response>
+    return res.type("text/xml").send(`
+<Response>
+  <Say>Sorry, this number is not configured.</Say>
+</Response>
     `);
   }
 
-  res.send(`
-    <Response>
-      <Gather input="speech" timeout="4" speechTimeout="auto" action="/process" method="POST">
-        <Say voice="Polly.Amy-Neural">
-          Hello. Thank you for calling ${business.name}. How can I help you today?
-        </Say>
-      </Gather>
-    </Response>
+  return res.type("text/xml").send(`
+<Response>
+  <Say voice="Polly.Joanna-Neural">
+    Hello, thank you for calling ${business.business_name}. How can I help you today?
+  </Say>
+  <Gather input="speech" action="/process" method="POST" timeout="5" speechTimeout="auto" />
+</Response>
   `);
 });
 
-// ===== VOICE PROCESS =====
+// VOICE PROCESS
 app.post("/process", async (req, res) => {
   try {
-    const fromNumber = req.body.From;
     const toNumber = req.body.To;
+    const fromNumber = req.body.From;
     const callSid = req.body.CallSid;
-    const userSpeech = req.body.SpeechResult || "";
+    const userSpeech = req.body.SpeechResult;
 
-    const business = await getBusinessByNumber(toNumber);
+    console.log("VOICE /process To:", toNumber, "CallSid:", callSid);
+
+    const business = await getBusinessByPhoneNumber(toNumber);
+
     if (!business) {
-      return res.send(`
-        <Response>
-          <Say>Business not found.</Say>
-        </Response>
+      return res.type("text/xml").send(`
+<Response>
+  <Say>Sorry, this number is not configured.</Say>
+</Response>
       `);
     }
 
     if (!userSpeech) {
-      return res.send(`
-        <Response>
-          <Redirect>/voice</Redirect>
-        </Response>
+      return res.type("text/xml").send(`
+<Response>
+  <Say voice="Polly.Joanna-Neural">Sorry, I didn’t catch that. Could you repeat?</Say>
+  <Gather input="speech" action="/process" method="POST" timeout="5" speechTimeout="auto" />
+</Response>
       `);
     }
 
+    // store user
     await storeConversation(
       business.id,
       fromNumber,
@@ -158,6 +178,7 @@ app.post("/process", async (req, res) => {
       callSid
     );
 
+    // session memory (per call)
     const history = await getVoiceHistory(business.id, callSid);
 
     const aiReply = await generateAIReply(
@@ -166,6 +187,7 @@ app.post("/process", async (req, res) => {
       userSpeech
     );
 
+    // store assistant
     await storeConversation(
       business.id,
       fromNumber,
@@ -175,52 +197,58 @@ app.post("/process", async (req, res) => {
       callSid
     );
 
-    res.send(`
-      <Response>
-        <Gather input="speech" timeout="4" speechTimeout="auto" action="/process" method="POST">
-          <Say voice="Polly.Amy-Neural">
-            ${aiReply}
-          </Say>
-        </Gather>
-      </Response>
+    return res.type("text/xml").send(`
+<Response>
+  <Say voice="Polly.Joanna-Neural">${aiReply}</Say>
+  <Gather input="speech" action="/process" method="POST" timeout="5" speechTimeout="auto" />
+</Response>
     `);
   } catch (err) {
     console.error("Voice error:", err.message);
 
-    res.send(`
-      <Response>
-        <Say>Sorry, something went wrong.</Say>
-      </Response>
+    return res.type("text/xml").send(`
+<Response>
+  <Say>Sorry, something went wrong.</Say>
+</Response>
     `);
   }
 });
 
-// ===== SMS =====
+// SMS
 app.post("/sms", async (req, res) => {
   try {
-    const fromNumber = req.body.From;
     const toNumber = req.body.To;
-    const body = req.body.Body;
+    const fromNumber = req.body.From;
+    const userMessage = req.body.Body;
 
-    const business = await getBusinessByNumber(toNumber);
+    console.log("SMS /sms To:", toNumber);
+
+    const business = await getBusinessByPhoneNumber(toNumber);
+
     if (!business) {
-      return res.send("Number not configured.");
+      return res.type("text/xml").send(`
+<Response>
+  <Message>Sorry, this number is not configured.</Message>
+</Response>
+      `);
     }
 
-    await storeConversation(
-      business.id,
-      fromNumber,
-      "sms",
-      "user",
-      body
-    );
+    if (!userMessage) {
+      return res.type("text/xml").send(`
+<Response>
+  <Message>Sorry, I didn’t catch that.</Message>
+</Response>
+      `);
+    }
 
-    const history = await getSMSHistory(business.id, fromNumber);
+    await storeConversation(business.id, fromNumber, "sms", "user", userMessage);
+
+    const history = await getSmsHistory(business.id, fromNumber);
 
     const aiReply = await generateAIReply(
       business.system_prompt,
       history,
-      body
+      userMessage
     );
 
     await storeConversation(
@@ -231,17 +259,21 @@ app.post("/sms", async (req, res) => {
       aiReply
     );
 
-    res.send(`
-      <Response>
-        <Message>${aiReply}</Message>
-      </Response>
+    return res.type("text/xml").send(`
+<Response>
+  <Message>${aiReply}</Message>
+</Response>
     `);
   } catch (err) {
     console.error("SMS error:", err.message);
-    res.send("Something went wrong.");
+
+    return res.type("text/xml").send(`
+<Response>
+  <Message>Sorry, something went wrong.</Message>
+</Response>
+    `);
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
