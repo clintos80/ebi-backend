@@ -159,8 +159,15 @@ function getOAuthClient() {
 // Start OAuth (MVP: identify business by its Twilio phone_number in query)
 app.get("/auth/google/start", async (req, res) => {
   try {
-    const phoneNumber = req.query.phone_number; // e.g. +17087295506
+    let phoneNumber = req.query.phone_number;
+
     if (!phoneNumber) return res.status(400).send("Missing phone_number");
+
+    // Fix: query params treat "+" as space, normalize it
+    phoneNumber = String(phoneNumber).trim().replace(/\s+/g, "");
+    if (!phoneNumber.startsWith("+")) phoneNumber = `+${phoneNumber}`;
+
+    console.log("OAuth start phone_number:", phoneNumber);
 
     const business = await getBusinessByPhoneNumber(phoneNumber);
     if (!business) return res.status(404).send("Business not found");
@@ -170,7 +177,7 @@ app.get("/auth/google/start", async (req, res) => {
       access_type: "offline",
       prompt: "consent",
       scope: ["https://www.googleapis.com/auth/calendar.events"],
-      state: business.id, // store business id in state
+      state: business.id,
     });
 
     return res.redirect(url);
