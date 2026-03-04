@@ -3,6 +3,10 @@ require("dotenv").config();
 const express = require("express");
 const { createClient } = require("@supabase/supabase-js");
 const OpenAI = require("openai");
+const { google } = require("googleapis");
+const chrono = require("chrono-node");
+const { DateTime } = require("luxon");
+const twilio = require("twilio");
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -15,37 +19,10 @@ const supabase = createClient(
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-/* ===============================
-   LATENCY TRICK 1: Business cache
-================================= */
-const BUSINESS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 mins
-const businessCache = new Map(); // toNumber -> { business, expiresAt }
-
-/* ===============================
-   LATENCY TRICK 2: In-memory voice session history (per CallSid)
-================================= */
-const voiceSessionHistory = new Map(); // callSid -> [{role, message}]
-const VOICE_SESSION_TTL_MS = 20 * 60 * 1000;
-const voiceSessionExpiry = new Map();
-
-function touchVoiceSession(callSid) {
-  voiceSessionExpiry.set(callSid, Date.now() + VOICE_SESSION_TTL_MS);
-}
-
-function cleanupExpiredSessions() {
-  const now = Date.now();
-  for (const [sid, exp] of voiceSessionExpiry.entries()) {
-    if (exp <= now) {
-      voiceSessionExpiry.delete(sid);
-      voiceSessionHistory.delete(sid);
-    }
-  }
-}
-setInterval(cleanupExpiredSessions, 60 * 1000).unref();
-
-/* ===============================
-   Helpers
-================================= */
+const twilioClient =
+  process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
+    ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
+    : null;
 
 function escapeXml(unsafe) {
   return String(unsafe ?? "")
@@ -55,6 +32,12 @@ function escapeXml(unsafe) {
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&apos;");
 }
+
+/* ===============================
+   LATENCY TRICK 1: Business cache
+================================= */
+const BUSINESS_CACHE_TTL_MS = 10 * 60 * 1000;
+const businessCache = new Map();
 
 async function getBusinessByPhoneNumber(toNumber) {
   const cached = businessCache.get(toNumber);
@@ -82,6 +65,30 @@ async function getBusinessByPhoneNumber(toNumber) {
   return data;
 }
 
+/* ===============================
+   LATENCY TRICK 2: In-memory voice session history (per CallSid)
+================================= */
+const voiceSessionHistory = new Map();
+const VOICE_SESSION_TTL_MS = 20 * 60 * 1000;
+const voiceSessionExpiry = new Map();
+
+function touchVoiceSession(callSid) {
+  voiceSessionExpiry.set(callSid, Date.now() + VOICE_SESSION_TTL_MS);
+}
+function cleanupExpiredSessions() {
+  const now = Date.now();
+  for (const [sid, exp] of voiceSessionExpiry.entries()) {
+    if (exp <= now) {
+      voiceSessionExpiry.delete(sid);
+      voiceSessionHistory.delete(sid);
+    }
+  }
+}
+setInterval(cleanupExpiredSessions, 60 * 1000).unref();
+
+/* ===============================
+   DB helpers
+================================= */
 async function storeConversation(businessId, userPhone, channel, role, message, callSid = null) {
   const { error } = await supabase.from("conversations").insert([
     { business_id: businessId, user_phone: userPhone, channel, role, message, call_sid: callSid },
@@ -130,14 +137,197 @@ async function insertSmsLead(businessId, customerPhone, lead) {
     status: lead.status || "new",
   };
 
-  const { error } = await supabase.from("leads").insert([payload]);
-  if (error) console.error("SMS lead insert error:", error.message);
+  const { data, error } = await supabase.from("leads").insert([payload]).select("*").maybeSingle();
+  if (error) {
+    console.error("SMS lead insert error:", error.message);
+    return null;
+  }
+  return data;
 }
 
 /* ===============================
-   OpenAI: STRICT JSON output
+   Google Calendar OAuth + API
 ================================= */
+function getOAuthClient() {
+  return new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    process.env.GOOGLE_REDIRECT_URL
+  );
+}
 
+// Start OAuth (MVP: identify business by its Twilio phone_number in query)
+app.get("/auth/google/start", async (req, res) => {
+  try {
+    const phoneNumber = req.query.phone_number; // e.g. +17087295506
+    if (!phoneNumber) return res.status(400).send("Missing phone_number");
+
+    const business = await getBusinessByPhoneNumber(phoneNumber);
+    if (!business) return res.status(404).send("Business not found");
+
+    const oauth2Client = getOAuthClient();
+    const url = oauth2Client.generateAuthUrl({
+      access_type: "offline",
+      prompt: "consent",
+      scope: ["https://www.googleapis.com/auth/calendar.events"],
+      state: business.id, // store business id in state
+    });
+
+    return res.redirect(url);
+  } catch (e) {
+    console.error("OAuth start error:", e.message);
+    return res.status(500).send("OAuth start failed");
+  }
+});
+
+app.get("/auth/google/callback", async (req, res) => {
+  try {
+    const code = req.query.code;
+    const businessId = req.query.state;
+    if (!code || !businessId) return res.status(400).send("Missing code/state");
+
+    const oauth2Client = getOAuthClient();
+    const { tokens } = await oauth2Client.getToken(code);
+
+    if (!tokens.refresh_token) {
+      return res.status(400).send("No refresh token returned. Try again with consent.");
+    }
+
+    const { error } = await supabase
+      .from("businesses")
+      .update({
+        gcal_refresh_token: tokens.refresh_token,
+        gcal_calendar_id: "primary",
+      })
+      .eq("id", businessId);
+
+    if (error) {
+      console.error("Store refresh token error:", error.message);
+      return res.status(500).send("Failed to store token");
+    }
+
+    return res.send("Google Calendar connected. You can close this tab.");
+  } catch (e) {
+    console.error("OAuth callback error:", e.message);
+    return res.status(500).send("OAuth callback failed");
+  }
+});
+
+function parsePreferredTime(preferredTime, tz) {
+  if (!preferredTime) return null;
+  const base = DateTime.now().setZone(tz || "Australia/Sydney").toJSDate();
+  const results = chrono.parse(preferredTime, base);
+  if (!results || results.length === 0) return null;
+
+  const d = results[0].start?.date();
+  if (!d) return null;
+
+  const start = DateTime.fromJSDate(d).setZone(tz || "Australia/Sydney");
+  // Default 1 hour
+  const end = start.plus({ hours: 1 });
+  return { start, end };
+}
+
+async function createCalendarEvent(business, lead, customerPhone) {
+  if (!business?.gcal_refresh_token) return { ok: false, reason: "no_refresh_token" };
+
+  const tz = business.timezone || "Australia/Sydney";
+  const time = parsePreferredTime(lead.preferred_time, tz);
+  if (!time) return { ok: false, reason: "time_unparseable" };
+
+  const oauth2Client = getOAuthClient();
+  oauth2Client.setCredentials({ refresh_token: business.gcal_refresh_token });
+
+  const calendar = google.calendar({ version: "v3", auth: oauth2Client });
+
+  const titleBits = [
+    lead.customer_name ? lead.customer_name : "New lead",
+    lead.job_type ? `- ${lead.job_type}` : "",
+  ].join(" ").trim();
+
+  const description = [
+    `Phone: ${customerPhone || ""}`,
+    `Name: ${lead.customer_name || ""}`,
+    `Job: ${lead.job_type || ""}`,
+    `Urgency: ${lead.urgency || ""}`,
+    `Suburb: ${lead.suburb || ""}`,
+    `Address: ${lead.address || ""}`,
+    `Preferred time: ${lead.preferred_time || ""}`,
+    `Notes: ${lead.notes || ""}`,
+  ].join("\n");
+
+  const event = await calendar.events.insert({
+    calendarId: business.gcal_calendar_id || "primary",
+    requestBody: {
+      summary: titleBits || "New lead",
+      description,
+      start: { dateTime: time.start.toISO(), timeZone: tz },
+      end: { dateTime: time.end.toISO(), timeZone: tz },
+    },
+  });
+
+  return { ok: true, eventId: event.data.id };
+}
+
+async function sendOwnerSms(business, lead, customerPhone) {
+  if (!twilioClient) return { ok: false, reason: "twilio_not_configured" };
+  if (!business?.owner_phone) return { ok: false, reason: "no_owner_phone" };
+  if (!process.env.TWILIO_FROM_NUMBER) return { ok: false, reason: "no_from_number" };
+
+  const msg = [
+    `New lead (${business.business_name})`,
+    `Name: ${lead.customer_name || "-"}`,
+    `Phone: ${customerPhone || "-"}`,
+    `Job: ${lead.job_type || "-"}`,
+    `Urgency: ${lead.urgency || "-"}`,
+    `Suburb: ${lead.suburb || "-"}`,
+    `Address: ${lead.address || "-"}`,
+    `Pref time: ${lead.preferred_time || "-"}`,
+  ].join("\n");
+
+  await twilioClient.messages.create({
+    from: process.env.TWILIO_FROM_NUMBER,
+    to: business.owner_phone,
+    body: msg,
+  });
+
+  return { ok: true };
+}
+
+// Mark lead as "notified=true" atomically, only once (voice)
+async function claimVoiceNotification(businessId, callSid) {
+  const { data, error } = await supabase
+    .from("leads")
+    .update({ notified: true })
+    .eq("business_id", businessId)
+    .eq("call_sid", callSid)
+    .eq("notified", false)
+    .select("*")
+    .maybeSingle();
+
+  if (error) {
+    console.error("Claim notify error:", error.message);
+    return null;
+  }
+  return data; // null means already claimed / not found
+}
+
+async function updateLeadEvent(businessId, callSid, calendarEventId, notesAppend) {
+  const { error } = await supabase
+    .from("leads")
+    .update({
+      calendar_event_id: calendarEventId || null,
+      notes: notesAppend || null,
+    })
+    .eq("business_id", businessId)
+    .eq("call_sid", callSid);
+
+  if (error) console.error("Update lead event error:", error.message);
+}
+
+/* ===============================
+   OpenAI strict JSON schema
+================================= */
 const LEAD_REPLY_SCHEMA = {
   name: "lead_reply",
   strict: true,
@@ -197,23 +387,22 @@ async function getAssistantJson(systemPrompt, history, userInput) {
 
 You are taking inbound calls/SMS for an Australian electrician.
 
-Goal: capture these fields naturally:
+Capture these fields naturally:
 - customer_name
 - suburb
 - address
 - job_type
 - urgency
 - preferred_time
-Caller phone is already known by the system; you may keep customer_phone as null.
+Phone is known by the system; keep customer_phone as null.
 
-Style rules (critical):
-- Sound natural and human.
-- Keep reply to 1–2 short sentences.
+Style rules:
+- 1–2 short sentences.
 - Ask for at most ONE missing field per turn.
-- Do NOT repeat the same question if you already asked it in the last assistant message.
-- If the caller is vague, ask a single clarifying question.
+- Do not repeat the same question if you already asked it in the last assistant message.
+- If lead_ready=true: confirm details briefly and say someone will confirm shortly.
 
-Set lead_ready=true only when you have:
+lead_ready=true only when you have:
 customer_name + job_type + urgency + preferred_time + (suburb OR address).`;
 
   const completion = await openai.chat.completions.create({
@@ -229,7 +418,6 @@ customer_name + job_type + urgency + preferred_time + (suburb OR address).`;
     ],
   });
 
-  // With json_schema strict, this should always parse.
   const raw = completion.choices?.[0]?.message?.content || "{}";
   return JSON.parse(raw);
 }
@@ -237,7 +425,6 @@ customer_name + job_type + urgency + preferred_time + (suburb OR address).`;
 /* ===============================
    Routes
 ================================= */
-
 app.get("/", (req, res) => res.send("Ebi SaaS backend is running"));
 
 app.post("/voice", async (req, res) => {
@@ -246,9 +433,7 @@ app.post("/voice", async (req, res) => {
 
   if (!business) {
     return res.type("text/xml").send(`
-<Response>
-  <Say>Sorry, this number is not configured.</Say>
-</Response>`);
+<Response><Say>Sorry, this number is not configured.</Say></Response>`);
   }
 
   return res.type("text/xml").send(`
@@ -285,16 +470,13 @@ app.post("/process", async (req, res) => {
     const currentHistory = voiceSessionHistory.get(sessionKey) || [];
     touchVoiceSession(sessionKey);
 
-    // Persist user + assistant to DB async (don’t block)
     void storeConversation(business.id, fromNumber, "voice", "user", userSpeech, callSid);
 
     const assistantJson = await getAssistantJson(business.system_prompt, currentHistory, userSpeech);
-
     const reply = (assistantJson.reply || "").trim() || "Thanks—what suburb are you in?";
     const leadReady = Boolean(assistantJson.lead_ready);
     const lead = assistantJson.lead || {};
 
-    // Update in-memory session history for faster next turn
     const nextHistory = [
       ...currentHistory,
       { role: "user", message: userSpeech },
@@ -304,13 +486,32 @@ app.post("/process", async (req, res) => {
 
     void storeConversation(business.id, fromNumber, "voice", "assistant", reply, callSid);
 
-    // Upsert voice lead (1 per callSid)
-    void upsertVoiceLead(
-      business.id,
-      callSid,
-      { ...lead, lead_ready: leadReady },
-      fromNumber
-    );
+    // Upsert lead continuously per call
+    void upsertVoiceLead(business.id, callSid, { ...lead, lead_ready: leadReady }, fromNumber);
+
+    // If lead becomes ready, notify once + create calendar event (if calendar connected)
+    if (leadReady && callSid) {
+      // Claim notification once (atomic)
+      const claimed = await claimVoiceNotification(business.id, callSid);
+      if (claimed) {
+        // Create calendar event (best effort)
+        const cal = await createCalendarEvent(business, lead, fromNumber);
+
+        if (cal.ok) {
+          await updateLeadEvent(business.id, callSid, cal.eventId, claimed.notes || null);
+        } else if (cal.reason === "time_unparseable") {
+          await updateLeadEvent(
+            business.id,
+            callSid,
+            null,
+            `${(claimed.notes || "").trim()}\nPreferred time unclear: ${lead.preferred_time || ""}`.trim()
+          );
+        }
+
+        // SMS notify (best effort)
+        await sendOwnerSms(business, lead, fromNumber);
+      }
+    }
 
     return res.type("text/xml").send(`
 <Response>
@@ -341,10 +542,8 @@ app.post("/sms", async (req, res) => {
 <Response><Message>Sorry, I didn’t catch that.</Message></Response>`);
     }
 
-    // Store user async
     void storeConversation(business.id, fromNumber, "sms", "user", userMessage, null);
 
-    // Persistent SMS history (keep it small)
     const { data: smsHistory } = await supabase
       .from("conversations")
       .select("role, message")
@@ -354,16 +553,31 @@ app.post("/sms", async (req, res) => {
       .limit(12);
 
     const assistantJson = await getAssistantJson(business.system_prompt, smsHistory || [], userMessage);
-
     const reply = (assistantJson.reply || "").trim() || "Thanks—what suburb are you in?";
     const leadReady = Boolean(assistantJson.lead_ready);
     const lead = assistantJson.lead || {};
 
     void storeConversation(business.id, fromNumber, "sms", "assistant", reply, null);
 
-    // Create a lead only once it’s ready (avoid spam)
+    // Create one lead record when ready, notify + calendar
     if (leadReady) {
-      void insertSmsLead(business.id, fromNumber, lead);
+      const newLead = await insertSmsLead(business.id, fromNumber, lead);
+      if (newLead) {
+        await sendOwnerSms(business, lead, fromNumber);
+        // Calendar (best effort)
+        const cal = await createCalendarEvent(business, lead, fromNumber);
+        if (cal.ok) {
+          await supabase
+            .from("leads")
+            .update({ calendar_event_id: cal.eventId, notified: true })
+            .eq("id", newLead.id);
+        } else {
+          await supabase
+            .from("leads")
+            .update({ notified: true })
+            .eq("id", newLead.id);
+        }
+      }
     }
 
     return res.type("text/xml").send(`
