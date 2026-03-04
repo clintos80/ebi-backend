@@ -62,7 +62,10 @@ async function getBusinessByPhoneNumber(toNumber) {
   }
 
   if (data) {
-    businessCache.set(toNumber, { business: data, expiresAt: Date.now() + BUSINESS_CACHE_TTL_MS });
+    businessCache.set(toNumber, {
+      business: data,
+      expiresAt: Date.now() + BUSINESS_CACHE_TTL_MS,
+    });
   }
 
   return data;
@@ -84,10 +87,48 @@ function cleanupExpiredSessions() {
     if (exp <= now) {
       voiceSessionExpiry.delete(sid);
       voiceSessionHistory.delete(sid);
+      callState.delete(sid);
     }
   }
 }
 setInterval(cleanupExpiredSessions, 60 * 1000).unref();
+
+/* ===============================
+   Call state: filler + silence retries
+================================= */
+const callState = new Map(); // callSid -> { lastFiller: string, silenceCount: number }
+
+function getCallState(callSid) {
+  if (!callSid) return { lastFiller: "", silenceCount: 0 };
+  if (!callState.has(callSid)) callState.set(callSid, { lastFiller: "", silenceCount: 0 });
+  return callState.get(callSid);
+}
+
+function pickFiller(callSid, userSpeech) {
+  const state = getCallState(callSid);
+  const text = (userSpeech || "").trim().toLowerCase();
+
+  // Short answers like: "Panania", "Yes", "Clinton", "Tomorrow 5pm"
+  const looksLikeShortAnswer = text.length <= 18;
+
+  // Looks like a suburb/location: "I'm in Panania" OR just "Panania"
+  const looksLikeLocation =
+    /\b(i'?m in|im in|in|at)\b/.test(text) || /^[a-z\s-]{3,25}$/.test(text);
+
+  // If it doesn't sound like a problem description, acknowledge instead of "checking"
+  const shortAck = ["Perfect, thanks.", "Got it.", "Okay, noted.", "Great, thanks."];
+  const thinking = ["Alright — one sec.", "Thanks — just a moment.", "Okay — give me a second."];
+
+  const pool = looksLikeShortAnswer || looksLikeLocation ? shortAck : thinking;
+
+  let chosen = pool[Math.floor(Math.random() * pool.length)];
+  if (chosen === state.lastFiller && pool.length > 1) {
+    chosen = pool.find((x) => x !== state.lastFiller) || chosen;
+  }
+
+  state.lastFiller = chosen;
+  return chosen;
+}
 
 /* ===============================
    DB Helpers
@@ -139,7 +180,7 @@ async function claimVoiceNotification(businessId, callSid) {
     console.error("Claim notify error:", error.message);
     return null;
   }
-  return data; // null = already claimed or not found
+  return data;
 }
 
 async function updateLeadCalendarInfo(businessId, callSid, calendarEventId, notesAppend) {
@@ -264,7 +305,6 @@ app.get("/auth/google/start", async (req, res) => {
     let phoneNumber = req.query.phone_number;
     if (!phoneNumber) return res.status(400).send("Missing phone_number");
 
-    // '+' becomes space in query params; normalize
     phoneNumber = String(phoneNumber).trim().replace(/\s+/g, "");
     if (!phoneNumber.startsWith("+")) phoneNumber = `+${phoneNumber}`;
 
@@ -403,7 +443,6 @@ async function sendOwnerSmsBestEffort(business, lead, customerPhone) {
 
     return { ok: true };
   } catch (e) {
-    // e.g. AU geo permissions not enabled — do not break calls.
     console.error("Owner SMS failed:", e.message);
     return { ok: false, reason: "sms_error" };
   }
@@ -450,11 +489,15 @@ app.post("/voice", async (req, res) => {
   <Say voice="Polly.Joanna-Neural">
     Hello, thank you for calling ${escapeXml(business.business_name)}. How can I help you today?
   </Say>
-  <Gather input="speech" action="/process" method="POST" timeout="5" speechTimeout="auto" />
+  <Gather input="speech" action="/process" method="POST" timeout="7" speechTimeout="auto" actionOnEmptyResult="true" />
 </Response>`);
 });
 
-/* ========= FAST STEP: /process (instant ack + redirect) ========= */
+/* ========= FAST STEP: /process =========
+   - Handles silence retries
+   - Uses context-aware filler (not repetitive / not weird for suburb)
+   - Redirects to /process2 for AI
+========================================= */
 app.post("/process", async (req, res) => {
   try {
     const toNumber = req.body.To;
@@ -467,13 +510,36 @@ app.post("/process", async (req, res) => {
       return res.type("text/xml").send(`<Response><Say>Sorry, this number is not configured.</Say></Response>`);
     }
 
+    const state = getCallState(callSid);
+
+    // Silence / stutter / no transcript
     if (!userSpeech) {
+      state.silenceCount += 1;
+
+      const prompt =
+        state.silenceCount === 1
+          ? "No worries — take your time. Could you say that again?"
+          : state.silenceCount === 2
+          ? "It’s a bit hard to hear — could you repeat that once more?"
+          : "No problem — I’ll send you an SMS to continue. Goodbye.";
+
+      if (state.silenceCount >= 3) {
+        return res.type("text/xml").send(`
+<Response>
+  <Say voice="Polly.Joanna-Neural">${escapeXml(prompt)}</Say>
+  <Hangup/>
+</Response>`);
+      }
+
       return res.type("text/xml").send(`
 <Response>
-  <Say voice="Polly.Joanna-Neural">Sorry, I didn’t catch that—could you repeat?</Say>
-  <Gather input="speech" action="/process" method="POST" timeout="5" speechTimeout="auto" />
+  <Say voice="Polly.Joanna-Neural">${escapeXml(prompt)}</Say>
+  <Gather input="speech" action="/process" method="POST" timeout="7" speechTimeout="auto" actionOnEmptyResult="true" />
 </Response>`);
     }
+
+    // reset silence count once we get speech
+    state.silenceCount = 0;
 
     // Persist user msg async
     void storeConversation(business.id, fromNumber, "voice", "user", userSpeech, callSid);
@@ -486,10 +552,12 @@ app.post("/process", async (req, res) => {
     const nextHistory = [...currentHistory, { role: "user", message: userSpeech }].slice(-10);
     voiceSessionHistory.set(sessionKey, nextHistory);
 
-    // Fast acknowledgement (caller hears this immediately)
+    // Context-aware filler
+    const filler = pickFiller(callSid, userSpeech);
+
     return res.type("text/xml").send(`
 <Response>
-  <Say voice="Polly.Joanna-Neural">Got it—one moment while I check that.</Say>
+  <Say voice="Polly.Joanna-Neural">${escapeXml(filler)}</Say>
   <Redirect method="POST">/process2</Redirect>
 </Response>`);
   } catch (err) {
@@ -498,7 +566,7 @@ app.post("/process", async (req, res) => {
   }
 });
 
-/* ========= AI STEP: /process2 (OpenAI + reply + gather) ========= */
+/* ========= AI STEP: /process2 ========= */
 app.post("/process2", async (req, res) => {
   try {
     const toNumber = req.body.To;
@@ -521,7 +589,7 @@ app.post("/process2", async (req, res) => {
       return res.type("text/xml").send(`
 <Response>
   <Say voice="Polly.Joanna-Neural">Sorry—could you repeat that?</Say>
-  <Gather input="speech" action="/process" method="POST" timeout="5" speechTimeout="auto" />
+  <Gather input="speech" action="/process" method="POST" timeout="7" speechTimeout="auto" actionOnEmptyResult="true" />
 </Response>`);
     }
 
@@ -541,14 +609,14 @@ app.post("/process2", async (req, res) => {
     // Upsert lead async
     void upsertVoiceLead(business.id, callSid, { ...lead, lead_ready: leadReady }, fromNumber);
 
-    // Respond to Twilio immediately
+    // Respond to Twilio
     res.type("text/xml").send(`
 <Response>
   <Say voice="Polly.Joanna-Neural">${escapeXml(reply)}</Say>
-  <Gather input="speech" action="/process" method="POST" timeout="5" speechTimeout="auto" />
+  <Gather input="speech" action="/process" method="POST" timeout="7" speechTimeout="auto" actionOnEmptyResult="true" />
 </Response>`);
 
-    // Post actions in background (never break call)
+    // Post actions in background
     if (leadReady && callSid) {
       void runPostLeadActionsVoice({ business, callSid, lead, fromNumber });
     }
@@ -594,7 +662,7 @@ app.post("/sms", async (req, res) => {
 
     res.type("text/xml").send(`<Response><Message>${escapeXml(reply)}</Message></Response>`);
 
-    // Best effort follow-up (SMS is not a live call, so background work is fine)
+    // Best effort follow-up
     if (leadReady) {
       void sendOwnerSmsBestEffort(business, lead, fromNumber);
       void createCalendarEventBestEffort(business, lead, fromNumber);
