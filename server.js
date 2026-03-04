@@ -85,13 +85,17 @@ async function getConversationHistory(businessId, userPhone) {
 ================================= */
 
 async function generateAIReply(systemPrompt, history, userInput) {
+  const cleanedHistory = history
+    .filter(msg => msg.role && msg.message)
+    .map(msg => ({
+      role: msg.role,
+      content: msg.message
+    }));
+
   const messages = [
     { role: "system", content: systemPrompt },
-    ...history.map((msg) => ({
-      role: msg.role,
-      content: msg.message,
-    })),
-    { role: "user", content: userInput },
+    ...cleanedHistory,
+    { role: "user", content: userInput }
   ];
 
   const completion = await openai.chat.completions.create({
