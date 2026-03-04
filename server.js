@@ -17,7 +17,7 @@ app.use(express.json());
 ================================= */
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SECRET_KEY
+  process.env.SUPABASE_SECRET_KEY 
 );
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -40,10 +40,10 @@ function escapeXml(unsafe) {
 }
 
 /* ===============================
-   Latency trick 1: Business cache
+   Latency Trick #1: Business cache
 ================================= */
 const BUSINESS_CACHE_TTL_MS = 10 * 60 * 1000;
-const businessCache = new Map();
+const businessCache = new Map(); // toNumber -> { business, expiresAt }
 
 async function getBusinessByPhoneNumber(toNumber) {
   const cached = businessCache.get(toNumber);
@@ -62,19 +62,16 @@ async function getBusinessByPhoneNumber(toNumber) {
   }
 
   if (data) {
-    businessCache.set(toNumber, {
-      business: data,
-      expiresAt: Date.now() + BUSINESS_CACHE_TTL_MS,
-    });
+    businessCache.set(toNumber, { business: data, expiresAt: Date.now() + BUSINESS_CACHE_TTL_MS });
   }
 
   return data;
 }
 
 /* ===============================
-   Latency trick 2: In-memory voice session history (per CallSid)
+   Latency Trick #2: In-memory voice session history (per CallSid)
 ================================= */
-const voiceSessionHistory = new Map();
+const voiceSessionHistory = new Map(); // callSid -> [{role,message}]
 const VOICE_SESSION_TTL_MS = 20 * 60 * 1000;
 const voiceSessionExpiry = new Map();
 
@@ -93,25 +90,11 @@ function cleanupExpiredSessions() {
 setInterval(cleanupExpiredSessions, 60 * 1000).unref();
 
 /* ===============================
-   DB helpers
+   DB Helpers
 ================================= */
-async function storeConversation(
-  businessId,
-  userPhone,
-  channel,
-  role,
-  message,
-  callSid = null
-) {
+async function storeConversation(businessId, userPhone, channel, role, message, callSid = null) {
   const { error } = await supabase.from("conversations").insert([
-    {
-      business_id: businessId,
-      user_phone: userPhone,
-      channel,
-      role,
-      message,
-      call_sid: callSid,
-    },
+    { business_id: businessId, user_phone: userPhone, channel, role, message, call_sid: callSid },
   ]);
   if (error) console.error("Store conversation error:", error.message);
 }
@@ -174,7 +157,98 @@ async function updateLeadCalendarInfo(businessId, callSid, calendarEventId, note
 }
 
 /* ===============================
-   Google Calendar OAuth + API
+   OpenAI: Strict JSON schema output
+================================= */
+const LEAD_REPLY_SCHEMA = {
+  name: "lead_reply",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["reply", "lead_ready", "lead"],
+    properties: {
+      reply: { type: "string" },
+      lead_ready: { type: "boolean" },
+      lead: {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "customer_name",
+          "customer_phone",
+          "suburb",
+          "address",
+          "job_type",
+          "urgency",
+          "preferred_time",
+          "notes",
+          "status",
+        ],
+        properties: {
+          customer_name: { anyOf: [{ type: "string" }, { type: "null" }] },
+          customer_phone: { anyOf: [{ type: "string" }, { type: "null" }] },
+          suburb: { anyOf: [{ type: "string" }, { type: "null" }] },
+          address: { anyOf: [{ type: "string" }, { type: "null" }] },
+          job_type: { anyOf: [{ type: "string" }, { type: "null" }] },
+          urgency: {
+            anyOf: [
+              { type: "string", enum: ["emergency", "today", "this_week", "quote", "unknown"] },
+              { type: "null" },
+            ],
+          },
+          preferred_time: { anyOf: [{ type: "string" }, { type: "null" }] },
+          notes: { anyOf: [{ type: "string" }, { type: "null" }] },
+          status: {
+            anyOf: [
+              { type: "string", enum: ["new", "in_progress", "booked", "closed"] },
+              { type: "null" },
+            ],
+          },
+        },
+      },
+    },
+  },
+};
+
+async function getAssistantJson(systemPrompt, history, userInput) {
+  const cleanedHistory = (history || [])
+    .filter((m) => m && m.role && m.message)
+    .map((m) => ({ role: m.role, content: m.message }));
+
+  const system = `${systemPrompt}
+
+You are taking inbound calls/SMS for an Australian electrician.
+
+Capture these fields naturally:
+- customer_name
+- suburb
+- address
+- job_type
+- urgency
+- preferred_time
+Caller phone is known by the system; keep customer_phone as null.
+
+Style rules:
+- 1–2 short sentences.
+- Ask for at most ONE missing field per turn.
+- Do not repeat the same question if you already asked it in the last assistant message.
+- If the caller doesn't know the fault, ask symptom-based options (power outage, tripping switch, flickering, sparks, burning smell).
+- If lead_ready=true: confirm briefly and say someone will confirm shortly.
+
+lead_ready=true only when you have:
+customer_name + job_type + urgency + preferred_time + (suburb OR address).`;
+
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    response_format: { type: "json_schema", json_schema: LEAD_REPLY_SCHEMA },
+    messages: [{ role: "system", content: system }, ...cleanedHistory, { role: "user", content: userInput }],
+  });
+
+  const raw = completion.choices?.[0]?.message?.content || "{}";
+  return JSON.parse(raw);
+}
+
+/* ===============================
+   Google Calendar OAuth + Events
 ================================= */
 function getOAuthClient() {
   return new google.auth.OAuth2(
@@ -184,13 +258,13 @@ function getOAuthClient() {
   );
 }
 
-// Start OAuth (MVP: identify business by phone_number in query)
+// OAuth start: identify business by phone_number query param
 app.get("/auth/google/start", async (req, res) => {
   try {
     let phoneNumber = req.query.phone_number;
     if (!phoneNumber) return res.status(400).send("Missing phone_number");
 
-    // '+' in query params becomes space; normalize
+    // '+' becomes space in query params; normalize
     phoneNumber = String(phoneNumber).trim().replace(/\s+/g, "");
     if (!phoneNumber.startsWith("+")) phoneNumber = `+${phoneNumber}`;
 
@@ -222,17 +296,12 @@ app.get("/auth/google/callback", async (req, res) => {
     const { tokens } = await oauth2Client.getToken(code);
 
     if (!tokens.refresh_token) {
-      return res
-        .status(400)
-        .send("No refresh token returned. Try again with consent.");
+      return res.status(400).send("No refresh token returned. Try again with consent.");
     }
 
     const { error } = await supabase
       .from("businesses")
-      .update({
-        gcal_refresh_token: tokens.refresh_token,
-        gcal_calendar_id: "primary",
-      })
+      .update({ gcal_refresh_token: tokens.refresh_token, gcal_calendar_id: "primary" })
       .eq("id", businessId);
 
     if (error) {
@@ -249,7 +318,6 @@ app.get("/auth/google/callback", async (req, res) => {
 
 function parsePreferredTime(preferredTime, tz) {
   if (!preferredTime) return null;
-
   const zone = tz || "Australia/Sydney";
   const base = DateTime.now().setZone(zone).toJSDate();
 
@@ -335,107 +403,40 @@ async function sendOwnerSmsBestEffort(business, lead, customerPhone) {
 
     return { ok: true };
   } catch (e) {
-    // This is where your "region not enabled" error happens — now it won't break calls.
+    // e.g. AU geo permissions not enabled — do not break calls.
     console.error("Owner SMS failed:", e.message);
     return { ok: false, reason: "sms_error" };
   }
 }
 
 /* ===============================
-   OpenAI strict JSON schema
+   Post-lead actions (voice) — BEST EFFORT
 ================================= */
-const LEAD_REPLY_SCHEMA = {
-  name: "lead_reply",
-  strict: true,
-  schema: {
-    type: "object",
-    additionalProperties: false,
-    required: ["reply", "lead_ready", "lead"],
-    properties: {
-      reply: { type: "string" },
-      lead_ready: { type: "boolean" },
-      lead: {
-        type: "object",
-        additionalProperties: false,
-        required: [
-          "customer_name",
-          "customer_phone",
-          "suburb",
-          "address",
-          "job_type",
-          "urgency",
-          "preferred_time",
-          "notes",
-          "status",
-        ],
-        properties: {
-          customer_name: { anyOf: [{ type: "string" }, { type: "null" }] },
-          customer_phone: { anyOf: [{ type: "string" }, { type: "null" }] },
-          suburb: { anyOf: [{ type: "string" }, { type: "null" }] },
-          address: { anyOf: [{ type: "string" }, { type: "null" }] },
-          job_type: { anyOf: [{ type: "string" }, { type: "null" }] },
-          urgency: {
-            anyOf: [
-              { type: "string", enum: ["emergency", "today", "this_week", "quote", "unknown"] },
-              { type: "null" },
-            ],
-          },
-          preferred_time: { anyOf: [{ type: "string" }, { type: "null" }] },
-          notes: { anyOf: [{ type: "string" }, { type: "null" }] },
-          status: {
-            anyOf: [
-              { type: "string", enum: ["new", "in_progress", "booked", "closed"] },
-              { type: "null" },
-            ],
-          },
-        },
-      },
-    },
-  },
-};
+async function runPostLeadActionsVoice({ business, callSid, lead, fromNumber }) {
+  try {
+    const claimed = await claimVoiceNotification(business.id, callSid);
+    if (!claimed) return;
 
-async function getAssistantJson(systemPrompt, history, userInput) {
-  const cleanedHistory = (history || [])
-    .filter((m) => m && m.role && m.message)
-    .map((m) => ({ role: m.role, content: m.message }));
+    const cal = await createCalendarEventBestEffort(business, lead, fromNumber);
+    if (cal.ok) {
+      await updateLeadCalendarInfo(business.id, callSid, cal.eventId, claimed.notes ?? undefined);
+    } else if (cal.reason === "time_unparseable") {
+      const append = `${(claimed.notes || "").trim()}\nPreferred time unclear: ${lead.preferred_time || ""}`.trim();
+      await updateLeadCalendarInfo(business.id, callSid, undefined, append);
+    }
 
-  const system = `${systemPrompt}
-
-You are taking inbound calls/SMS for an Australian electrician.
-
-Capture these fields naturally:
-- customer_name
-- suburb
-- address
-- job_type
-- urgency
-- preferred_time
-Phone is known by the system; keep customer_phone as null.
-
-Style rules:
-- 1–2 short sentences.
-- Ask for at most ONE missing field per turn.
-- Do not repeat the same question if you already asked it in the last assistant message.
-- If lead_ready=true: confirm details briefly and say someone will confirm shortly.
-
-lead_ready=true only when you have:
-customer_name + job_type + urgency + preferred_time + (suburb OR address).`;
-
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    response_format: { type: "json_schema", json_schema: LEAD_REPLY_SCHEMA },
-    messages: [{ role: "system", content: system }, ...cleanedHistory, { role: "user", content: userInput }],
-  });
-
-  const raw = completion.choices?.[0]?.message?.content || "{}";
-  return JSON.parse(raw);
+    await sendOwnerSmsBestEffort(business, lead, fromNumber);
+  } catch (e) {
+    console.error("Post lead actions (voice) failed:", e.message);
+  }
 }
 
 /* ===============================
    Routes
 ================================= */
-app.get("/", (req, res) => res.send("Ebi SaaS backend is running"));
+app.get("/", (req, res) => res.send("Ebi backend is running"));
 
+/* ========= VOICE ENTRY ========= */
 app.post("/voice", async (req, res) => {
   const toNumber = req.body.To;
   const business = await getBusinessByPhoneNumber(toNumber);
@@ -453,28 +454,7 @@ app.post("/voice", async (req, res) => {
 </Response>`);
 });
 
-async function runPostLeadActionsVoice({ business, callSid, lead, fromNumber }) {
-  try {
-    // claim notification once
-    const claimed = await claimVoiceNotification(business.id, callSid);
-    if (!claimed) return;
-
-    // calendar best effort
-    const cal = await createCalendarEventBestEffort(business, lead, fromNumber);
-    if (cal.ok) {
-      await updateLeadCalendarInfo(business.id, callSid, cal.eventId, claimed.notes ?? undefined);
-    } else if (cal.reason === "time_unparseable") {
-      const append = `${(claimed.notes || "").trim()}\nPreferred time unclear: ${lead.preferred_time || ""}`.trim();
-      await updateLeadCalendarInfo(business.id, callSid, undefined, append);
-    }
-
-    // sms best effort (this is where your AU geo error happens; now it won't break calls)
-    await sendOwnerSmsBestEffort(business, lead, fromNumber);
-  } catch (e) {
-    console.error("Post lead actions (voice) failed:", e.message);
-  }
-}
-
+/* ========= FAST STEP: /process (instant ack + redirect) ========= */
 app.post("/process", async (req, res) => {
   try {
     const toNumber = req.body.To;
@@ -490,50 +470,95 @@ app.post("/process", async (req, res) => {
     if (!userSpeech) {
       return res.type("text/xml").send(`
 <Response>
-  <Say voice="Polly.Joanna-Neural">Sorry, I didn’t catch that—could you say it again?</Say>
+  <Say voice="Polly.Joanna-Neural">Sorry, I didn’t catch that—could you repeat?</Say>
   <Gather input="speech" action="/process" method="POST" timeout="5" speechTimeout="auto" />
 </Response>`);
+    }
+
+    // Persist user msg async
+    void storeConversation(business.id, fromNumber, "voice", "user", userSpeech, callSid);
+
+    // Update session history quickly so /process2 can use it
+    const sessionKey = callSid || `voice:${fromNumber}`;
+    const currentHistory = voiceSessionHistory.get(sessionKey) || [];
+    touchVoiceSession(sessionKey);
+
+    const nextHistory = [...currentHistory, { role: "user", message: userSpeech }].slice(-10);
+    voiceSessionHistory.set(sessionKey, nextHistory);
+
+    // Fast acknowledgement (caller hears this immediately)
+    return res.type("text/xml").send(`
+<Response>
+  <Say voice="Polly.Joanna-Neural">Got it—one moment while I check that.</Say>
+  <Redirect method="POST">/process2</Redirect>
+</Response>`);
+  } catch (err) {
+    console.error("Voice /process error:", err.message);
+    return res.type("text/xml").send(`<Response><Say>Sorry, something went wrong.</Say></Response>`);
+  }
+});
+
+/* ========= AI STEP: /process2 (OpenAI + reply + gather) ========= */
+app.post("/process2", async (req, res) => {
+  try {
+    const toNumber = req.body.To;
+    const fromNumber = req.body.From;
+    const callSid = req.body.CallSid;
+
+    const business = await getBusinessByPhoneNumber(toNumber);
+    if (!business) {
+      return res.type("text/xml").send(`<Response><Say>Sorry, this number is not configured.</Say></Response>`);
     }
 
     const sessionKey = callSid || `voice:${fromNumber}`;
     const currentHistory = voiceSessionHistory.get(sessionKey) || [];
     touchVoiceSession(sessionKey);
 
-    // persist user async
-    void storeConversation(business.id, fromNumber, "voice", "user", userSpeech, callSid);
+    const lastUser = [...currentHistory].reverse().find((m) => m.role === "user");
+    const userSpeech = lastUser?.message;
+
+    if (!userSpeech) {
+      return res.type("text/xml").send(`
+<Response>
+  <Say voice="Polly.Joanna-Neural">Sorry—could you repeat that?</Say>
+  <Gather input="speech" action="/process" method="POST" timeout="5" speechTimeout="auto" />
+</Response>`);
+    }
 
     const assistantJson = await getAssistantJson(business.system_prompt, currentHistory, userSpeech);
+
     const reply = (assistantJson.reply || "").trim() || "Thanks—what suburb are you in?";
     const leadReady = Boolean(assistantJson.lead_ready);
     const lead = assistantJson.lead || {};
 
-    const nextHistory = [...currentHistory, { role: "user", message: userSpeech }, { role: "assistant", message: reply }].slice(-10);
+    // Update session history
+    const nextHistory = [...currentHistory, { role: "assistant", message: reply }].slice(-10);
     voiceSessionHistory.set(sessionKey, nextHistory);
 
-    // persist assistant async
+    // Persist assistant async
     void storeConversation(business.id, fromNumber, "voice", "assistant", reply, callSid);
 
-    // upsert lead continuously (best effort, but this is DB not Twilio)
+    // Upsert lead async
     void upsertVoiceLead(business.id, callSid, { ...lead, lead_ready: leadReady }, fromNumber);
 
-    // IMPORTANT: Respond to Twilio FIRST so call never breaks
+    // Respond to Twilio immediately
     res.type("text/xml").send(`
 <Response>
   <Say voice="Polly.Joanna-Neural">${escapeXml(reply)}</Say>
   <Gather input="speech" action="/process" method="POST" timeout="5" speechTimeout="auto" />
 </Response>`);
 
-    // After response: run notifications/calendar best-effort in background
+    // Post actions in background (never break call)
     if (leadReady && callSid) {
       void runPostLeadActionsVoice({ business, callSid, lead, fromNumber });
     }
   } catch (err) {
-    console.error("Voice error:", err.message);
+    console.error("Voice /process2 error:", err.message);
     return res.type("text/xml").send(`<Response><Say>Sorry, something went wrong.</Say></Response>`);
   }
 });
 
-/* SMS route left as-is (webhook isn’t a live call), but we still best-effort notify */
+/* ========= SMS ========= */
 app.post("/sms", async (req, res) => {
   try {
     const toNumber = req.body.To;
@@ -544,6 +569,7 @@ app.post("/sms", async (req, res) => {
     if (!business) {
       return res.type("text/xml").send(`<Response><Message>Sorry, this number is not configured.</Message></Response>`);
     }
+
     if (!userMessage) {
       return res.type("text/xml").send(`<Response><Message>Sorry, I didn’t catch that.</Message></Response>`);
     }
@@ -559,6 +585,7 @@ app.post("/sms", async (req, res) => {
       .limit(12);
 
     const assistantJson = await getAssistantJson(business.system_prompt, smsHistory || [], userMessage);
+
     const reply = (assistantJson.reply || "").trim() || "Thanks—what suburb are you in?";
     const leadReady = Boolean(assistantJson.lead_ready);
     const lead = assistantJson.lead || {};
@@ -567,9 +594,8 @@ app.post("/sms", async (req, res) => {
 
     res.type("text/xml").send(`<Response><Message>${escapeXml(reply)}</Message></Response>`);
 
-    // post actions (best effort)
+    // Best effort follow-up (SMS is not a live call, so background work is fine)
     if (leadReady) {
-      // You can extend SMS flow later with notified flag & calendar id too, same concept.
       void sendOwnerSmsBestEffort(business, lead, fromNumber);
       void createCalendarEventBestEffort(business, lead, fromNumber);
     }
