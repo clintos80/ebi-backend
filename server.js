@@ -155,20 +155,6 @@ app.post("/process", async (req, res) => {
     let aiReply = "Sorry, I didn't catch that.";
 
     if (userSpeech) {
-
-      // Immediately respond to avoid silence
-      const holdMessage = `
-<Response>
-  <Say voice="Polly.Joanna-Neural">
-    Please hold while I check that for you.
-  </Say>
-  <Pause length="1"/>
-</Response>
-      `;
-
-      res.type("text/xml").send(holdMessage);
-
-      // Now continue AI processing in background
       const history = await getConversationHistory(
         business.id,
         fromNumber
@@ -195,12 +181,28 @@ app.post("/process", async (req, res) => {
         "assistant",
         aiReply
       );
-
-      return;
     }
+
+    const twiml = `
+<Response>
+  <Pause length="1"/>
+  <Say voice="Polly.Joanna-Neural">
+    ${aiReply}
+  </Say>
+  <Gather input="speech" action="/process" method="POST" timeout="5" />
+</Response>
+    `;
+
+    res.type("text/xml").send(twiml);
 
   } catch (error) {
     console.error("Voice error:", error.message);
+
+    res.type("text/xml").send(`
+<Response>
+  <Say>Sorry, something went wrong.</Say>
+</Response>
+    `);
   }
 });
 
