@@ -31,6 +31,7 @@ const openai = new OpenAI({
    DATABASE HELPERS
 ================================= */
 
+// Get business by Twilio number
 async function getBusinessByPhone(phoneNumber) {
   const { data, error } = await supabase
     .from("businesses")
@@ -47,6 +48,7 @@ async function getBusinessByPhone(phoneNumber) {
   return data;
 }
 
+// Store conversation (user + assistant)
 async function storeConversation(
   businessId,
   userPhone,
@@ -65,6 +67,7 @@ async function storeConversation(
   ]);
 }
 
+// Get last 10 messages for memory
 async function getConversationHistory(businessId, userPhone) {
   const { data } = await supabase
     .from("conversations")
@@ -111,6 +114,7 @@ app.get("/", (req, res) => {
 
 app.post("/voice", async (req, res) => {
   const toNumber = req.body.To;
+
   const business = await getBusinessByPhone(toNumber);
 
   if (!business) {
@@ -166,6 +170,7 @@ app.post("/process", async (req, res) => {
         userSpeech
       );
 
+      // Store user message
       await storeConversation(
         business.id,
         fromNumber,
@@ -174,6 +179,7 @@ app.post("/process", async (req, res) => {
         userSpeech
       );
 
+      // Store AI reply
       await storeConversation(
         business.id,
         fromNumber,
@@ -185,7 +191,6 @@ app.post("/process", async (req, res) => {
 
     const twiml = `
 <Response>
-  <Pause length="1"/>
   <Say voice="Polly.Joanna-Neural">
     ${aiReply}
   </Say>
@@ -194,7 +199,6 @@ app.post("/process", async (req, res) => {
     `;
 
     res.type("text/xml").send(twiml);
-
   } catch (error) {
     console.error("Voice error:", error.message);
 
@@ -238,6 +242,7 @@ app.post("/sms", async (req, res) => {
         userMessage
       );
 
+      // Store user message
       await storeConversation(
         business.id,
         fromNumber,
@@ -246,6 +251,7 @@ app.post("/sms", async (req, res) => {
         userMessage
       );
 
+      // Store AI reply
       await storeConversation(
         business.id,
         fromNumber,
@@ -262,7 +268,6 @@ app.post("/sms", async (req, res) => {
     `;
 
     res.type("text/xml").send(twiml);
-
   } catch (error) {
     console.error("SMS error:", error.message);
 
