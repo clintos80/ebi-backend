@@ -12,6 +12,9 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
+/* ===============================
+   Clients
+================================= */
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY
@@ -24,6 +27,9 @@ const twilioClient =
     ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
     : null;
 
+/* ===============================
+   Utilities
+================================= */
 function escapeXml(unsafe) {
   return String(unsafe ?? "")
     .replaceAll("&", "&amp;")
@@ -34,7 +40,7 @@ function escapeXml(unsafe) {
 }
 
 /* ===============================
-   LATENCY TRICK 1: Business cache
+   Latency trick 1: Business cache
 ================================= */
 const BUSINESS_CACHE_TTL_MS = 10 * 60 * 1000;
 const businessCache = new Map();
@@ -66,7 +72,7 @@ async function getBusinessByPhoneNumber(toNumber) {
 }
 
 /* ===============================
-   LATENCY TRICK 2: In-memory voice session history (per CallSid)
+   Latency trick 2: In-memory voice session history (per CallSid)
 ================================= */
 const voiceSessionHistory = new Map();
 const VOICE_SESSION_TTL_MS = 20 * 60 * 1000;
@@ -89,9 +95,23 @@ setInterval(cleanupExpiredSessions, 60 * 1000).unref();
 /* ===============================
    DB helpers
 ================================= */
-async function storeConversation(businessId, userPhone, channel, role, message, callSid = null) {
+async function storeConversation(
+  businessId,
+  userPhone,
+  channel,
+  role,
+  message,
+  callSid = null
+) {
   const { error } = await supabase.from("conversations").insert([
-    { business_id: businessId, user_phone: userPhone, channel, role, message, call_sid: callSid },
+    {
+      business_id: businessId,
+      user_phone: userPhone,
+      channel,
+      role,
+      message,
+      call_sid: callSid,
+    },
   ]);
   if (error) console.error("Store conversation error:", error.message);
 }
@@ -121,28 +141,36 @@ async function upsertVoiceLead(businessId, callSid, lead, customerPhone) {
   if (error) console.error("Lead upsert error:", error.message);
 }
 
-async function insertSmsLead(businessId, customerPhone, lead) {
-  const payload = {
-    business_id: businessId,
-    source: "sms",
-    call_sid: null,
-    customer_phone: customerPhone || lead.customer_phone || null,
-    customer_name: lead.customer_name || null,
-    suburb: lead.suburb || null,
-    address: lead.address || null,
-    job_type: lead.job_type || null,
-    urgency: lead.urgency || null,
-    preferred_time: lead.preferred_time || null,
-    notes: lead.notes || null,
-    status: lead.status || "new",
-  };
+// Claim notification once (atomic)
+async function claimVoiceNotification(businessId, callSid) {
+  const { data, error } = await supabase
+    .from("leads")
+    .update({ notified: true })
+    .eq("business_id", businessId)
+    .eq("call_sid", callSid)
+    .eq("notified", false)
+    .select("*")
+    .maybeSingle();
 
-  const { data, error } = await supabase.from("leads").insert([payload]).select("*").maybeSingle();
   if (error) {
-    console.error("SMS lead insert error:", error.message);
+    console.error("Claim notify error:", error.message);
     return null;
   }
-  return data;
+  return data; // null = already claimed or not found
+}
+
+async function updateLeadCalendarInfo(businessId, callSid, calendarEventId, notesAppend) {
+  const patch = {};
+  if (calendarEventId !== undefined) patch.calendar_event_id = calendarEventId;
+  if (notesAppend !== undefined) patch.notes = notesAppend;
+
+  const { error } = await supabase
+    .from("leads")
+    .update(patch)
+    .eq("business_id", businessId)
+    .eq("call_sid", callSid);
+
+  if (error) console.error("Update lead calendar info error:", error.message);
 }
 
 /* ===============================
@@ -156,18 +184,15 @@ function getOAuthClient() {
   );
 }
 
-// Start OAuth (MVP: identify business by its Twilio phone_number in query)
+// Start OAuth (MVP: identify business by phone_number in query)
 app.get("/auth/google/start", async (req, res) => {
   try {
     let phoneNumber = req.query.phone_number;
-
     if (!phoneNumber) return res.status(400).send("Missing phone_number");
 
-    // Fix: query params treat "+" as space, normalize it
+    // '+' in query params becomes space; normalize
     phoneNumber = String(phoneNumber).trim().replace(/\s+/g, "");
     if (!phoneNumber.startsWith("+")) phoneNumber = `+${phoneNumber}`;
-
-    console.log("OAuth start phone_number:", phoneNumber);
 
     const business = await getBusinessByPhoneNumber(phoneNumber);
     if (!business) return res.status(404).send("Business not found");
@@ -197,7 +222,9 @@ app.get("/auth/google/callback", async (req, res) => {
     const { tokens } = await oauth2Client.getToken(code);
 
     if (!tokens.refresh_token) {
-      return res.status(400).send("No refresh token returned. Try again with consent.");
+      return res
+        .status(400)
+        .send("No refresh token returned. Try again with consent.");
     }
 
     const { error } = await supabase
@@ -222,114 +249,96 @@ app.get("/auth/google/callback", async (req, res) => {
 
 function parsePreferredTime(preferredTime, tz) {
   if (!preferredTime) return null;
-  const base = DateTime.now().setZone(tz || "Australia/Sydney").toJSDate();
+
+  const zone = tz || "Australia/Sydney";
+  const base = DateTime.now().setZone(zone).toJSDate();
+
   const results = chrono.parse(preferredTime, base);
   if (!results || results.length === 0) return null;
 
   const d = results[0].start?.date();
   if (!d) return null;
 
-  const start = DateTime.fromJSDate(d).setZone(tz || "Australia/Sydney");
-  // Default 1 hour
+  const start = DateTime.fromJSDate(d).setZone(zone);
   const end = start.plus({ hours: 1 });
-  return { start, end };
+  return { start, end, zone };
 }
 
-async function createCalendarEvent(business, lead, customerPhone) {
-  if (!business?.gcal_refresh_token) return { ok: false, reason: "no_refresh_token" };
+async function createCalendarEventBestEffort(business, lead, customerPhone) {
+  try {
+    if (!business?.gcal_refresh_token) return { ok: false, reason: "no_refresh_token" };
 
-  const tz = business.timezone || "Australia/Sydney";
-  const time = parsePreferredTime(lead.preferred_time, tz);
-  if (!time) return { ok: false, reason: "time_unparseable" };
+    const tz = business.timezone || "Australia/Sydney";
+    const time = parsePreferredTime(lead.preferred_time, tz);
+    if (!time) return { ok: false, reason: "time_unparseable" };
 
-  const oauth2Client = getOAuthClient();
-  oauth2Client.setCredentials({ refresh_token: business.gcal_refresh_token });
+    const oauth2Client = getOAuthClient();
+    oauth2Client.setCredentials({ refresh_token: business.gcal_refresh_token });
 
-  const calendar = google.calendar({ version: "v3", auth: oauth2Client });
+    const calendar = google.calendar({ version: "v3", auth: oauth2Client });
 
-  const titleBits = [
-    lead.customer_name ? lead.customer_name : "New lead",
-    lead.job_type ? `- ${lead.job_type}` : "",
-  ].join(" ").trim();
+    const title = `${lead.customer_name || "New lead"}${lead.job_type ? ` - ${lead.job_type}` : ""}`.trim();
 
-  const description = [
-    `Phone: ${customerPhone || ""}`,
-    `Name: ${lead.customer_name || ""}`,
-    `Job: ${lead.job_type || ""}`,
-    `Urgency: ${lead.urgency || ""}`,
-    `Suburb: ${lead.suburb || ""}`,
-    `Address: ${lead.address || ""}`,
-    `Preferred time: ${lead.preferred_time || ""}`,
-    `Notes: ${lead.notes || ""}`,
-  ].join("\n");
+    const description = [
+      `Phone: ${customerPhone || ""}`,
+      `Name: ${lead.customer_name || ""}`,
+      `Job: ${lead.job_type || ""}`,
+      `Urgency: ${lead.urgency || ""}`,
+      `Suburb: ${lead.suburb || ""}`,
+      `Address: ${lead.address || ""}`,
+      `Preferred time: ${lead.preferred_time || ""}`,
+      `Notes: ${lead.notes || ""}`,
+    ].join("\n");
 
-  const event = await calendar.events.insert({
-    calendarId: business.gcal_calendar_id || "primary",
-    requestBody: {
-      summary: titleBits || "New lead",
-      description,
-      start: { dateTime: time.start.toISO(), timeZone: tz },
-      end: { dateTime: time.end.toISO(), timeZone: tz },
-    },
-  });
+    const event = await calendar.events.insert({
+      calendarId: business.gcal_calendar_id || "primary",
+      requestBody: {
+        summary: title || "New lead",
+        description,
+        start: { dateTime: time.start.toISO(), timeZone: time.zone },
+        end: { dateTime: time.end.toISO(), timeZone: time.zone },
+      },
+    });
 
-  return { ok: true, eventId: event.data.id };
-}
-
-async function sendOwnerSms(business, lead, customerPhone) {
-  if (!twilioClient) return { ok: false, reason: "twilio_not_configured" };
-  if (!business?.owner_phone) return { ok: false, reason: "no_owner_phone" };
-  if (!process.env.TWILIO_FROM_NUMBER) return { ok: false, reason: "no_from_number" };
-
-  const msg = [
-    `New lead (${business.business_name})`,
-    `Name: ${lead.customer_name || "-"}`,
-    `Phone: ${customerPhone || "-"}`,
-    `Job: ${lead.job_type || "-"}`,
-    `Urgency: ${lead.urgency || "-"}`,
-    `Suburb: ${lead.suburb || "-"}`,
-    `Address: ${lead.address || "-"}`,
-    `Pref time: ${lead.preferred_time || "-"}`,
-  ].join("\n");
-
-  await twilioClient.messages.create({
-    from: process.env.TWILIO_FROM_NUMBER,
-    to: business.owner_phone,
-    body: msg,
-  });
-
-  return { ok: true };
-}
-
-// Mark lead as "notified=true" atomically, only once (voice)
-async function claimVoiceNotification(businessId, callSid) {
-  const { data, error } = await supabase
-    .from("leads")
-    .update({ notified: true })
-    .eq("business_id", businessId)
-    .eq("call_sid", callSid)
-    .eq("notified", false)
-    .select("*")
-    .maybeSingle();
-
-  if (error) {
-    console.error("Claim notify error:", error.message);
-    return null;
+    return { ok: true, eventId: event.data.id };
+  } catch (e) {
+    console.error("Calendar create failed:", e.message);
+    return { ok: false, reason: "calendar_error" };
   }
-  return data; // null means already claimed / not found
 }
 
-async function updateLeadEvent(businessId, callSid, calendarEventId, notesAppend) {
-  const { error } = await supabase
-    .from("leads")
-    .update({
-      calendar_event_id: calendarEventId || null,
-      notes: notesAppend || null,
-    })
-    .eq("business_id", businessId)
-    .eq("call_sid", callSid);
+/* ===============================
+   Twilio SMS notify (best effort)
+================================= */
+async function sendOwnerSmsBestEffort(business, lead, customerPhone) {
+  try {
+    if (!twilioClient) return { ok: false, reason: "twilio_not_configured" };
+    if (!business?.owner_phone) return { ok: false, reason: "no_owner_phone" };
+    if (!process.env.TWILIO_FROM_NUMBER) return { ok: false, reason: "no_from_number" };
 
-  if (error) console.error("Update lead event error:", error.message);
+    const msg = [
+      `New lead (${business.business_name})`,
+      `Name: ${lead.customer_name || "-"}`,
+      `Caller: ${customerPhone || "-"}`,
+      `Job: ${lead.job_type || "-"}`,
+      `Urgency: ${lead.urgency || "-"}`,
+      `Suburb: ${lead.suburb || "-"}`,
+      `Address: ${lead.address || "-"}`,
+      `Preferred: ${lead.preferred_time || "-"}`,
+    ].join("\n");
+
+    await twilioClient.messages.create({
+      from: process.env.TWILIO_FROM_NUMBER,
+      to: business.owner_phone,
+      body: msg,
+    });
+
+    return { ok: true };
+  } catch (e) {
+    // This is where your "region not enabled" error happens — now it won't break calls.
+    console.error("Owner SMS failed:", e.message);
+    return { ok: false, reason: "sms_error" };
+  }
 }
 
 /* ===============================
@@ -414,15 +423,8 @@ customer_name + job_type + urgency + preferred_time + (suburb OR address).`;
 
   const completion = await openai.chat.completions.create({
     model: "gpt-4o-mini",
-    response_format: {
-      type: "json_schema",
-      json_schema: LEAD_REPLY_SCHEMA,
-    },
-    messages: [
-      { role: "system", content: system },
-      ...cleanedHistory,
-      { role: "user", content: userInput },
-    ],
+    response_format: { type: "json_schema", json_schema: LEAD_REPLY_SCHEMA },
+    messages: [{ role: "system", content: system }, ...cleanedHistory, { role: "user", content: userInput }],
   });
 
   const raw = completion.choices?.[0]?.message?.content || "{}";
@@ -439,8 +441,7 @@ app.post("/voice", async (req, res) => {
   const business = await getBusinessByPhoneNumber(toNumber);
 
   if (!business) {
-    return res.type("text/xml").send(`
-<Response><Say>Sorry, this number is not configured.</Say></Response>`);
+    return res.type("text/xml").send(`<Response><Say>Sorry, this number is not configured.</Say></Response>`);
   }
 
   return res.type("text/xml").send(`
@@ -452,6 +453,28 @@ app.post("/voice", async (req, res) => {
 </Response>`);
 });
 
+async function runPostLeadActionsVoice({ business, callSid, lead, fromNumber }) {
+  try {
+    // claim notification once
+    const claimed = await claimVoiceNotification(business.id, callSid);
+    if (!claimed) return;
+
+    // calendar best effort
+    const cal = await createCalendarEventBestEffort(business, lead, fromNumber);
+    if (cal.ok) {
+      await updateLeadCalendarInfo(business.id, callSid, cal.eventId, claimed.notes ?? undefined);
+    } else if (cal.reason === "time_unparseable") {
+      const append = `${(claimed.notes || "").trim()}\nPreferred time unclear: ${lead.preferred_time || ""}`.trim();
+      await updateLeadCalendarInfo(business.id, callSid, undefined, append);
+    }
+
+    // sms best effort (this is where your AU geo error happens; now it won't break calls)
+    await sendOwnerSmsBestEffort(business, lead, fromNumber);
+  } catch (e) {
+    console.error("Post lead actions (voice) failed:", e.message);
+  }
+}
+
 app.post("/process", async (req, res) => {
   try {
     const toNumber = req.body.To;
@@ -461,8 +484,7 @@ app.post("/process", async (req, res) => {
 
     const business = await getBusinessByPhoneNumber(toNumber);
     if (!business) {
-      return res.type("text/xml").send(`
-<Response><Say>Sorry, this number is not configured.</Say></Response>`);
+      return res.type("text/xml").send(`<Response><Say>Sorry, this number is not configured.</Say></Response>`);
     }
 
     if (!userSpeech) {
@@ -477,6 +499,7 @@ app.post("/process", async (req, res) => {
     const currentHistory = voiceSessionHistory.get(sessionKey) || [];
     touchVoiceSession(sessionKey);
 
+    // persist user async
     void storeConversation(business.id, fromNumber, "voice", "user", userSpeech, callSid);
 
     const assistantJson = await getAssistantJson(business.system_prompt, currentHistory, userSpeech);
@@ -484,54 +507,33 @@ app.post("/process", async (req, res) => {
     const leadReady = Boolean(assistantJson.lead_ready);
     const lead = assistantJson.lead || {};
 
-    const nextHistory = [
-      ...currentHistory,
-      { role: "user", message: userSpeech },
-      { role: "assistant", message: reply },
-    ].slice(-10);
+    const nextHistory = [...currentHistory, { role: "user", message: userSpeech }, { role: "assistant", message: reply }].slice(-10);
     voiceSessionHistory.set(sessionKey, nextHistory);
 
+    // persist assistant async
     void storeConversation(business.id, fromNumber, "voice", "assistant", reply, callSid);
 
-    // Upsert lead continuously per call
+    // upsert lead continuously (best effort, but this is DB not Twilio)
     void upsertVoiceLead(business.id, callSid, { ...lead, lead_ready: leadReady }, fromNumber);
 
-    // If lead becomes ready, notify once + create calendar event (if calendar connected)
-    if (leadReady && callSid) {
-      // Claim notification once (atomic)
-      const claimed = await claimVoiceNotification(business.id, callSid);
-      if (claimed) {
-        // Create calendar event (best effort)
-        const cal = await createCalendarEvent(business, lead, fromNumber);
-
-        if (cal.ok) {
-          await updateLeadEvent(business.id, callSid, cal.eventId, claimed.notes || null);
-        } else if (cal.reason === "time_unparseable") {
-          await updateLeadEvent(
-            business.id,
-            callSid,
-            null,
-            `${(claimed.notes || "").trim()}\nPreferred time unclear: ${lead.preferred_time || ""}`.trim()
-          );
-        }
-
-        // SMS notify (best effort)
-        await sendOwnerSms(business, lead, fromNumber);
-      }
-    }
-
-    return res.type("text/xml").send(`
+    // IMPORTANT: Respond to Twilio FIRST so call never breaks
+    res.type("text/xml").send(`
 <Response>
   <Say voice="Polly.Joanna-Neural">${escapeXml(reply)}</Say>
   <Gather input="speech" action="/process" method="POST" timeout="5" speechTimeout="auto" />
 </Response>`);
+
+    // After response: run notifications/calendar best-effort in background
+    if (leadReady && callSid) {
+      void runPostLeadActionsVoice({ business, callSid, lead, fromNumber });
+    }
   } catch (err) {
     console.error("Voice error:", err.message);
-    return res.type("text/xml").send(`
-<Response><Say>Sorry, something went wrong.</Say></Response>`);
+    return res.type("text/xml").send(`<Response><Say>Sorry, something went wrong.</Say></Response>`);
   }
 });
 
+/* SMS route left as-is (webhook isn’t a live call), but we still best-effort notify */
 app.post("/sms", async (req, res) => {
   try {
     const toNumber = req.body.To;
@@ -540,13 +542,10 @@ app.post("/sms", async (req, res) => {
 
     const business = await getBusinessByPhoneNumber(toNumber);
     if (!business) {
-      return res.type("text/xml").send(`
-<Response><Message>Sorry, this number is not configured.</Message></Response>`);
+      return res.type("text/xml").send(`<Response><Message>Sorry, this number is not configured.</Message></Response>`);
     }
-
     if (!userMessage) {
-      return res.type("text/xml").send(`
-<Response><Message>Sorry, I didn’t catch that.</Message></Response>`);
+      return res.type("text/xml").send(`<Response><Message>Sorry, I didn’t catch that.</Message></Response>`);
     }
 
     void storeConversation(business.id, fromNumber, "sms", "user", userMessage, null);
@@ -566,33 +565,17 @@ app.post("/sms", async (req, res) => {
 
     void storeConversation(business.id, fromNumber, "sms", "assistant", reply, null);
 
-    // Create one lead record when ready, notify + calendar
-    if (leadReady) {
-      const newLead = await insertSmsLead(business.id, fromNumber, lead);
-      if (newLead) {
-        await sendOwnerSms(business, lead, fromNumber);
-        // Calendar (best effort)
-        const cal = await createCalendarEvent(business, lead, fromNumber);
-        if (cal.ok) {
-          await supabase
-            .from("leads")
-            .update({ calendar_event_id: cal.eventId, notified: true })
-            .eq("id", newLead.id);
-        } else {
-          await supabase
-            .from("leads")
-            .update({ notified: true })
-            .eq("id", newLead.id);
-        }
-      }
-    }
+    res.type("text/xml").send(`<Response><Message>${escapeXml(reply)}</Message></Response>`);
 
-    return res.type("text/xml").send(`
-<Response><Message>${escapeXml(reply)}</Message></Response>`);
+    // post actions (best effort)
+    if (leadReady) {
+      // You can extend SMS flow later with notified flag & calendar id too, same concept.
+      void sendOwnerSmsBestEffort(business, lead, fromNumber);
+      void createCalendarEventBestEffort(business, lead, fromNumber);
+    }
   } catch (err) {
     console.error("SMS error:", err.message);
-    return res.type("text/xml").send(`
-<Response><Message>Sorry, something went wrong.</Message></Response>`);
+    return res.type("text/xml").send(`<Response><Message>Sorry, something went wrong.</Message></Response>`);
   }
 });
 
