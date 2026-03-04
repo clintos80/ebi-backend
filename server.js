@@ -19,14 +19,14 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
    LATENCY TRICK 1: Business cache
 ================================= */
 const BUSINESS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 mins
-const businessCache = new Map(); // key: toNumber -> { business, expiresAt }
+const businessCache = new Map(); // toNumber -> { business, expiresAt }
 
 /* ===============================
-   LATENCY TRICK 2: In-memory session history
+   LATENCY TRICK 2: In-memory voice session history (per CallSid)
 ================================= */
-const voiceSessionHistory = new Map(); // callSid -> [{role, message}, ...]
-const VOICE_SESSION_TTL_MS = 20 * 60 * 1000; // 20 mins
-const voiceSessionExpiry = new Map(); // callSid -> expiresAt
+const voiceSessionHistory = new Map(); // callSid -> [{role, message}]
+const VOICE_SESSION_TTL_MS = 20 * 60 * 1000;
+const voiceSessionExpiry = new Map();
 
 function touchVoiceSession(callSid) {
   voiceSessionExpiry.set(callSid, Date.now() + VOICE_SESSION_TTL_MS);
@@ -34,10 +34,10 @@ function touchVoiceSession(callSid) {
 
 function cleanupExpiredSessions() {
   const now = Date.now();
-  for (const [callSid, exp] of voiceSessionExpiry.entries()) {
+  for (const [sid, exp] of voiceSessionExpiry.entries()) {
     if (exp <= now) {
-      voiceSessionExpiry.delete(callSid);
-      voiceSessionHistory.delete(callSid);
+      voiceSessionExpiry.delete(sid);
+      voiceSessionHistory.delete(sid);
     }
   }
 }
@@ -46,6 +46,15 @@ setInterval(cleanupExpiredSessions, 60 * 1000).unref();
 /* ===============================
    Helpers
 ================================= */
+
+function escapeXml(unsafe) {
+  return String(unsafe ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
 
 async function getBusinessByPhoneNumber(toNumber) {
   const cached = businessCache.get(toNumber);
@@ -64,7 +73,10 @@ async function getBusinessByPhoneNumber(toNumber) {
   }
 
   if (data) {
-    businessCache.set(toNumber, { business: data, expiresAt: Date.now() + BUSINESS_CACHE_TTL_MS });
+    businessCache.set(toNumber, {
+      business: data,
+      expiresAt: Date.now() + BUSINESS_CACHE_TTL_MS,
+    });
   }
 
   return data;
@@ -77,18 +89,14 @@ async function storeConversation(businessId, userPhone, channel, role, message, 
   if (error) console.error("Store conversation error:", error.message);
 }
 
-/**
- * Upsert a lead for voice calls by (business_id, call_sid).
- * For SMS, we create a new lead only when model says lead_ready=true (below).
- */
-async function upsertVoiceLead(businessId, callSid, lead) {
+async function upsertVoiceLead(businessId, callSid, lead, customerPhone) {
   if (!callSid) return;
 
   const payload = {
     business_id: businessId,
     source: "voice",
     call_sid: callSid,
-    customer_phone: lead.customer_phone || null,
+    customer_phone: customerPhone || lead.customer_phone || null,
     customer_name: lead.customer_name || null,
     suburb: lead.suburb || null,
     address: lead.address || null,
@@ -96,7 +104,7 @@ async function upsertVoiceLead(businessId, callSid, lead) {
     urgency: lead.urgency || null,
     preferred_time: lead.preferred_time || null,
     notes: lead.notes || null,
-    status: lead.status || "new",
+    status: lead.status || (lead.lead_ready ? "new" : "in_progress"),
   };
 
   const { error } = await supabase
@@ -106,12 +114,12 @@ async function upsertVoiceLead(businessId, callSid, lead) {
   if (error) console.error("Lead upsert error:", error.message);
 }
 
-async function insertSmsLead(businessId, fromNumber, lead) {
+async function insertSmsLead(businessId, customerPhone, lead) {
   const payload = {
     business_id: businessId,
     source: "sms",
     call_sid: null,
-    customer_phone: lead.customer_phone || fromNumber || null,
+    customer_phone: customerPhone || lead.customer_phone || null,
     customer_name: lead.customer_name || null,
     suburb: lead.suburb || null,
     address: lead.address || null,
@@ -126,89 +134,111 @@ async function insertSmsLead(businessId, fromNumber, lead) {
   if (error) console.error("SMS lead insert error:", error.message);
 }
 
-/**
- * One-call approach: model returns JSON with:
- * { reply: string, lead_ready: boolean, lead: { ...fields... } }
- */
+/* ===============================
+   OpenAI: STRICT JSON output
+================================= */
+
+const LEAD_REPLY_SCHEMA = {
+  name: "lead_reply",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["reply", "lead_ready", "lead"],
+    properties: {
+      reply: { type: "string" },
+      lead_ready: { type: "boolean" },
+      lead: {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "customer_name",
+          "customer_phone",
+          "suburb",
+          "address",
+          "job_type",
+          "urgency",
+          "preferred_time",
+          "notes",
+          "status",
+        ],
+        properties: {
+          customer_name: { anyOf: [{ type: "string" }, { type: "null" }] },
+          customer_phone: { anyOf: [{ type: "string" }, { type: "null" }] },
+          suburb: { anyOf: [{ type: "string" }, { type: "null" }] },
+          address: { anyOf: [{ type: "string" }, { type: "null" }] },
+          job_type: { anyOf: [{ type: "string" }, { type: "null" }] },
+          urgency: {
+            anyOf: [
+              { type: "string", enum: ["emergency", "today", "this_week", "quote", "unknown"] },
+              { type: "null" },
+            ],
+          },
+          preferred_time: { anyOf: [{ type: "string" }, { type: "null" }] },
+          notes: { anyOf: [{ type: "string" }, { type: "null" }] },
+          status: {
+            anyOf: [
+              { type: "string", enum: ["new", "in_progress", "booked", "closed"] },
+              { type: "null" },
+            ],
+          },
+        },
+      },
+    },
+  },
+};
+
 async function getAssistantJson(systemPrompt, history, userInput) {
   const cleanedHistory = (history || [])
     .filter((m) => m && m.role && m.message)
     .map((m) => ({ role: m.role, content: m.message }));
 
-  const messages = [
-    {
-      role: "system",
-      content: `${systemPrompt}
+  const system = `${systemPrompt}
 
-You must help the caller like a receptionist AND extract lead info.
+You are taking inbound calls/SMS for an Australian electrician.
 
-Return ONLY valid JSON in this exact shape:
-{
-  "reply": "string",
-  "lead_ready": boolean,
-  "lead": {
-    "customer_name": "string|null",
-    "customer_phone": "string|null",
-    "suburb": "string|null",
-    "address": "string|null",
-    "job_type": "string|null",
-    "urgency": "emergency|today|this_week|quote|unknown|null",
-    "preferred_time": "string|null",
-    "notes": "string|null",
-    "status": "new|in_progress|booked|closed|null"
-  }
-}
+Goal: capture these fields naturally:
+- customer_name
+- suburb
+- address
+- job_type
+- urgency
+- preferred_time
+Caller phone is already known by the system; you may keep customer_phone as null.
 
-Rules:
-- "reply" must sound natural and human.
-- Keep reply under 2 short sentences.
-- Ask ONLY for missing fields that matter next.
-- Set lead_ready=true only when you have: name, job_type, urgency, preferred_time, and at least suburb OR address.
-- If caller’s phone is known from the system, you may set customer_phone=null (we’ll store it ourselves).
-- Output JSON only. No markdown.`,
-    },
-    ...cleanedHistory,
-    { role: "user", content: userInput },
-  ];
+Style rules (critical):
+- Sound natural and human.
+- Keep reply to 1–2 short sentences.
+- Ask for at most ONE missing field per turn.
+- Do NOT repeat the same question if you already asked it in the last assistant message.
+- If the caller is vague, ask a single clarifying question.
+
+Set lead_ready=true only when you have:
+customer_name + job_type + urgency + preferred_time + (suburb OR address).`;
 
   const completion = await openai.chat.completions.create({
     model: "gpt-4o-mini",
-    messages,
+    response_format: {
+      type: "json_schema",
+      json_schema: LEAD_REPLY_SCHEMA,
+    },
+    messages: [
+      { role: "system", content: system },
+      ...cleanedHistory,
+      { role: "user", content: userInput },
+    ],
   });
 
-  const raw = completion.choices?.[0]?.message?.content || "";
-  try {
-    return JSON.parse(raw);
-  } catch (e) {
-    // Fallback: don’t break calls if model outputs non-JSON
-    console.error("JSON parse failed. Raw model output:", raw);
-    return {
-      reply: "Thanks—could you share your name, suburb, and what electrical issue you’re having?",
-      lead_ready: false,
-      lead: {
-        customer_name: null,
-        customer_phone: null,
-        suburb: null,
-        address: null,
-        job_type: null,
-        urgency: "unknown",
-        preferred_time: null,
-        notes: null,
-        status: "in_progress",
-      },
-    };
-  }
+  // With json_schema strict, this should always parse.
+  const raw = completion.choices?.[0]?.message?.content || "{}";
+  return JSON.parse(raw);
 }
 
 /* ===============================
    Routes
 ================================= */
 
-app.get("/", (req, res) => {
-  res.send("Ebi SaaS backend is running");
-});
-
-/* ========= VOICE ENTRY ========= */
+app.get("/", (req, res) => res.send("Ebi SaaS backend is running"));
 
 app.post("/voice", async (req, res) => {
   const toNumber = req.body.To;
@@ -218,21 +248,17 @@ app.post("/voice", async (req, res) => {
     return res.type("text/xml").send(`
 <Response>
   <Say>Sorry, this number is not configured.</Say>
-</Response>
-    `);
+</Response>`);
   }
 
   return res.type("text/xml").send(`
 <Response>
   <Say voice="Polly.Joanna-Neural">
-    Hello, thank you for calling ${business.business_name}. How can I help you today?
+    Hello, thank you for calling ${escapeXml(business.business_name)}. How can I help you today?
   </Say>
   <Gather input="speech" action="/process" method="POST" timeout="5" speechTimeout="auto" />
-</Response>
-  `);
+</Response>`);
 });
-
-/* ========= VOICE PROCESS ========= */
 
 app.post("/process", async (req, res) => {
   try {
@@ -244,37 +270,31 @@ app.post("/process", async (req, res) => {
     const business = await getBusinessByPhoneNumber(toNumber);
     if (!business) {
       return res.type("text/xml").send(`
-<Response>
-  <Say>Sorry, this number is not configured.</Say>
-</Response>
-      `);
+<Response><Say>Sorry, this number is not configured.</Say></Response>`);
     }
 
     if (!userSpeech) {
       return res.type("text/xml").send(`
 <Response>
-  <Say voice="Polly.Joanna-Neural">Sorry, I didn’t catch that. Could you repeat?</Say>
+  <Say voice="Polly.Joanna-Neural">Sorry, I didn’t catch that—could you say it again?</Say>
   <Gather input="speech" action="/process" method="POST" timeout="5" speechTimeout="auto" />
-</Response>
-      `);
+</Response>`);
     }
 
-    // Session history (in-memory, per call)
-    const sessionKey = callSid || "no-callSid";
+    const sessionKey = callSid || `voice:${fromNumber}`;
     const currentHistory = voiceSessionHistory.get(sessionKey) || [];
     touchVoiceSession(sessionKey);
 
-    // Store user message asynchronously (don’t block response)
-    void storeConversation(business.id, fromNumber, "voice", "user", userSpeech, callSid).catch(console.error);
+    // Persist user + assistant to DB async (don’t block)
+    void storeConversation(business.id, fromNumber, "voice", "user", userSpeech, callSid);
 
-    // Ask model for JSON response (reply + lead)
     const assistantJson = await getAssistantJson(business.system_prompt, currentHistory, userSpeech);
 
-    const reply = (assistantJson?.reply || "").toString().trim() || "Thanks—can you share a bit more detail?";
-    const lead = assistantJson?.lead || {};
-    const leadReady = Boolean(assistantJson?.lead_ready);
+    const reply = (assistantJson.reply || "").trim() || "Thanks—what suburb are you in?";
+    const leadReady = Boolean(assistantJson.lead_ready);
+    const lead = assistantJson.lead || {};
 
-    // Update in-memory session history (so next turn is fast)
+    // Update in-memory session history for faster next turn
     const nextHistory = [
       ...currentHistory,
       { role: "user", message: userSpeech },
@@ -282,34 +302,27 @@ app.post("/process", async (req, res) => {
     ].slice(-10);
     voiceSessionHistory.set(sessionKey, nextHistory);
 
-    // Store assistant message asynchronously
-    void storeConversation(business.id, fromNumber, "voice", "assistant", reply, callSid).catch(console.error);
+    void storeConversation(business.id, fromNumber, "voice", "assistant", reply, callSid);
 
-    // Upsert lead per callSid (so you get 1 lead record per call, updated as info arrives)
-    const leadForDb = {
-      ...lead,
-      customer_phone: fromNumber || lead.customer_phone || null,
-      status: leadReady ? (lead.status || "new") : "in_progress",
-    };
-    void upsertVoiceLead(business.id, callSid, leadForDb).catch(console.error);
+    // Upsert voice lead (1 per callSid)
+    void upsertVoiceLead(
+      business.id,
+      callSid,
+      { ...lead, lead_ready: leadReady },
+      fromNumber
+    );
 
     return res.type("text/xml").send(`
 <Response>
   <Say voice="Polly.Joanna-Neural">${escapeXml(reply)}</Say>
   <Gather input="speech" action="/process" method="POST" timeout="5" speechTimeout="auto" />
-</Response>
-    `);
+</Response>`);
   } catch (err) {
     console.error("Voice error:", err.message);
     return res.type("text/xml").send(`
-<Response>
-  <Say>Sorry, something went wrong.</Say>
-</Response>
-    `);
+<Response><Say>Sorry, something went wrong.</Say></Response>`);
   }
 });
-
-/* ========= SMS ========= */
 
 app.post("/sms", async (req, res) => {
   try {
@@ -320,24 +333,18 @@ app.post("/sms", async (req, res) => {
     const business = await getBusinessByPhoneNumber(toNumber);
     if (!business) {
       return res.type("text/xml").send(`
-<Response>
-  <Message>Sorry, this number is not configured.</Message>
-</Response>
-      `);
+<Response><Message>Sorry, this number is not configured.</Message></Response>`);
     }
 
     if (!userMessage) {
       return res.type("text/xml").send(`
-<Response>
-  <Message>Sorry, I didn’t catch that.</Message>
-</Response>
-      `);
+<Response><Message>Sorry, I didn’t catch that.</Message></Response>`);
     }
 
-    // Persist messages (async to reduce perceived delay)
-    void storeConversation(business.id, fromNumber, "sms", "user", userMessage, null).catch(console.error);
+    // Store user async
+    void storeConversation(business.id, fromNumber, "sms", "user", userMessage, null);
 
-    // For SMS, keep persistent memory by pulling last 12 messages (can cache later)
+    // Persistent SMS history (keep it small)
     const { data: smsHistory } = await supabase
       .from("conversations")
       .select("role, message")
@@ -348,48 +355,25 @@ app.post("/sms", async (req, res) => {
 
     const assistantJson = await getAssistantJson(business.system_prompt, smsHistory || [], userMessage);
 
-    const reply = (assistantJson?.reply || "").toString().trim() || "Thanks—can you share your suburb and what issue you’re having?";
-    const lead = assistantJson?.lead || {};
-    const leadReady = Boolean(assistantJson?.lead_ready);
+    const reply = (assistantJson.reply || "").trim() || "Thanks—what suburb are you in?";
+    const leadReady = Boolean(assistantJson.lead_ready);
+    const lead = assistantJson.lead || {};
 
-    void storeConversation(business.id, fromNumber, "sms", "assistant", reply, null).catch(console.error);
+    void storeConversation(business.id, fromNumber, "sms", "assistant", reply, null);
 
-    // For SMS: only create a lead when it’s ready (to avoid spamming rows)
+    // Create a lead only once it’s ready (avoid spam)
     if (leadReady) {
-      const leadForDb = {
-        ...lead,
-        customer_phone: fromNumber || lead.customer_phone || null,
-        status: lead.status || "new",
-      };
-      void insertSmsLead(business.id, fromNumber, leadForDb).catch(console.error);
+      void insertSmsLead(business.id, fromNumber, lead);
     }
 
     return res.type("text/xml").send(`
-<Response>
-  <Message>${escapeXml(reply)}</Message>
-</Response>
-    `);
+<Response><Message>${escapeXml(reply)}</Message></Response>`);
   } catch (err) {
     console.error("SMS error:", err.message);
     return res.type("text/xml").send(`
-<Response>
-  <Message>Sorry, something went wrong.</Message>
-</Response>
-    `);
+<Response><Message>Sorry, something went wrong.</Message></Response>`);
   }
 });
-
-/* ===============================
-   Utility: escape TwiML XML
-================================= */
-function escapeXml(unsafe) {
-  return String(unsafe)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&apos;");
-}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
