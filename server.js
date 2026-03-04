@@ -1,60 +1,44 @@
 require("dotenv").config();
-
 const express = require("express");
-const OpenAI = require("openai");
-const bodyParser = require("body-parser");
 const { createClient } = require("@supabase/supabase-js");
+const OpenAI = require("openai");
+const twilio = require("twilio");
 
 const app = express();
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
+const PORT = process.env.PORT || 3000;
 
-/* ===============================
-   SUPABASE SETUP
-================================= */
-
+// ===== Clients =====
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
+  process.env.SUPABASE_SERVICE_ROLE_KEY
 );
-
-/* ===============================
-   OPENAI SETUP
-================================= */
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-/* ===============================
-   DATABASE HELPERS
-================================= */
-
-// Get business by Twilio number
-async function getBusinessByPhone(phoneNumber) {
-  const { data, error } = await supabase
+// ===== Helper: Find Business =====
+async function getBusinessByNumber(twilioNumber) {
+  const { data } = await supabase
     .from("businesses")
     .select("*")
-    .eq("phone_number", phoneNumber)
-    .limit(1)
-    .maybeSingle();
-
-  if (error) {
-    console.error("Business lookup error:", error.message);
-    return null;
-  }
+    .eq("twilio_number", twilioNumber)
+    .single();
 
   return data;
 }
 
-// Store conversation (user + assistant)
+// ===== Store Conversation =====
 async function storeConversation(
   businessId,
   userPhone,
   channel,
   role,
-  message
+  message,
+  callSid = null
 ) {
   await supabase.from("conversations").insert([
     {
@@ -63,39 +47,49 @@ async function storeConversation(
       channel,
       role,
       message,
+      call_sid: callSid,
     },
   ]);
 }
 
-// Get last 10 messages for memory
-async function getConversationHistory(businessId, userPhone) {
+// ===== Voice History (Session-Based) =====
+async function getVoiceHistory(businessId, callSid) {
   const { data } = await supabase
     .from("conversations")
     .select("role, message")
     .eq("business_id", businessId)
-    .eq("user_phone", userPhone)
-    .order("created_at", { ascending: true })
-    .limit(10);
+    .eq("call_sid", callSid)
+    .order("created_at", { ascending: true });
 
   return data || [];
 }
 
-/* ===============================
-   AI GENERATION
-================================= */
+// ===== SMS History (Persistent) =====
+async function getSMSHistory(businessId, phone) {
+  const { data } = await supabase
+    .from("conversations")
+    .select("role, message")
+    .eq("business_id", businessId)
+    .eq("user_phone", phone)
+    .order("created_at", { ascending: true })
+    .limit(15);
 
+  return data || [];
+}
+
+// ===== Generate AI Reply =====
 async function generateAIReply(systemPrompt, history, userInput) {
   const cleanedHistory = history
-    .filter(msg => msg.role && msg.message)
-    .map(msg => ({
+    .filter((msg) => msg.role && msg.message)
+    .map((msg) => ({
       role: msg.role,
-      content: msg.message
+      content: msg.message,
     }));
 
   const messages = [
     { role: "system", content: systemPrompt },
     ...cleanedHistory,
-    { role: "user", content: userInput }
+    { role: "user", content: userInput },
   ];
 
   const completion = await openai.chat.completions.create({
@@ -106,185 +100,148 @@ async function generateAIReply(systemPrompt, history, userInput) {
   return completion.choices[0].message.content;
 }
 
-/* ===============================
-   ROUTES
-================================= */
-
-app.get("/", (req, res) => {
-  res.send("Ebi SaaS backend is running");
-});
-
-/* ========= VOICE START ========= */
-
+// ===== VOICE ENTRY =====
 app.post("/voice", async (req, res) => {
   const toNumber = req.body.To;
-
-  const business = await getBusinessByPhone(toNumber);
+  const business = await getBusinessByNumber(toNumber);
 
   if (!business) {
-    return res.type("text/xml").send(`
-<Response>
-  <Say>This number is not configured.</Say>
-</Response>
+    return res.send(`
+      <Response>
+        <Say>Sorry, this number is not configured.</Say>
+      </Response>
     `);
   }
 
-  const twiml = `
-<Response>
-  <Say voice="Polly.Joanna-Neural">
-    Hello, thank you for calling ${business.business_name}.
-    How can I help you today?
-  </Say>
-  <Gather input="speech" action="/process" method="POST" timeout="5" />
-</Response>
-  `;
-
-  res.type("text/xml").send(twiml);
+  res.send(`
+    <Response>
+      <Gather input="speech" timeout="4" speechTimeout="auto" action="/process" method="POST">
+        <Say voice="Polly.Amy-Neural">
+          Hello. Thank you for calling ${business.name}. How can I help you today?
+        </Say>
+      </Gather>
+    </Response>
+  `);
 });
 
-/* ========= VOICE PROCESS ========= */
-
+// ===== VOICE PROCESS =====
 app.post("/process", async (req, res) => {
   try {
-    const userSpeech = req.body.SpeechResult;
-    const toNumber = req.body.To;
     const fromNumber = req.body.From;
+    const toNumber = req.body.To;
+    const callSid = req.body.CallSid;
+    const userSpeech = req.body.SpeechResult || "";
 
-    const business = await getBusinessByPhone(toNumber);
-
+    const business = await getBusinessByNumber(toNumber);
     if (!business) {
-      return res.type("text/xml").send(`
-<Response>
-  <Say>This number is not configured.</Say>
-</Response>
+      return res.send(`
+        <Response>
+          <Say>Business not found.</Say>
+        </Response>
       `);
     }
 
-    let aiReply = "Sorry, I didn't catch that.";
-
-    if (userSpeech) {
-      const history = await getConversationHistory(
-        business.id,
-        fromNumber
-      );
-
-      aiReply = await generateAIReply(
-        business.system_prompt,
-        history,
-        userSpeech
-      );
-
-      // Store user message
-      await storeConversation(
-        business.id,
-        fromNumber,
-        "voice",
-        "user",
-        userSpeech
-      );
-
-      // Store AI reply
-      await storeConversation(
-        business.id,
-        fromNumber,
-        "voice",
-        "assistant",
-        aiReply
-      );
+    if (!userSpeech) {
+      return res.send(`
+        <Response>
+          <Redirect>/voice</Redirect>
+        </Response>
+      `);
     }
 
-    const twiml = `
-<Response>
-  <Say voice="Polly.Joanna-Neural">
-    ${aiReply}
-  </Say>
-  <Gather input="speech" action="/process" method="POST" timeout="5" />
-</Response>
-    `;
+    await storeConversation(
+      business.id,
+      fromNumber,
+      "voice",
+      "user",
+      userSpeech,
+      callSid
+    );
 
-    res.type("text/xml").send(twiml);
-  } catch (error) {
-    console.error("Voice error:", error.message);
+    const history = await getVoiceHistory(business.id, callSid);
 
-    res.type("text/xml").send(`
-<Response>
-  <Say>Sorry, something went wrong.</Say>
-</Response>
+    const aiReply = await generateAIReply(
+      business.system_prompt,
+      history,
+      userSpeech
+    );
+
+    await storeConversation(
+      business.id,
+      fromNumber,
+      "voice",
+      "assistant",
+      aiReply,
+      callSid
+    );
+
+    res.send(`
+      <Response>
+        <Gather input="speech" timeout="4" speechTimeout="auto" action="/process" method="POST">
+          <Say voice="Polly.Amy-Neural">
+            ${aiReply}
+          </Say>
+        </Gather>
+      </Response>
+    `);
+  } catch (err) {
+    console.error("Voice error:", err.message);
+
+    res.send(`
+      <Response>
+        <Say>Sorry, something went wrong.</Say>
+      </Response>
     `);
   }
 });
 
-/* ========= SMS ========= */
-
+// ===== SMS =====
 app.post("/sms", async (req, res) => {
   try {
-    const userMessage = req.body.Body;
-    const toNumber = req.body.To;
     const fromNumber = req.body.From;
+    const toNumber = req.body.To;
+    const body = req.body.Body;
 
-    const business = await getBusinessByPhone(toNumber);
-
+    const business = await getBusinessByNumber(toNumber);
     if (!business) {
-      return res.type("text/xml").send(`
-<Response>
-  <Message>This number is not configured.</Message>
-</Response>
-      `);
+      return res.send("Number not configured.");
     }
 
-    let aiReply = "Sorry, I didn't understand that.";
+    await storeConversation(
+      business.id,
+      fromNumber,
+      "sms",
+      "user",
+      body
+    );
 
-    if (userMessage) {
-      const history = await getConversationHistory(
-        business.id,
-        fromNumber
-      );
+    const history = await getSMSHistory(business.id, fromNumber);
 
-      aiReply = await generateAIReply(
-        business.system_prompt,
-        history,
-        userMessage
-      );
+    const aiReply = await generateAIReply(
+      business.system_prompt,
+      history,
+      body
+    );
 
-      // Store user message
-      await storeConversation(
-        business.id,
-        fromNumber,
-        "sms",
-        "user",
-        userMessage
-      );
+    await storeConversation(
+      business.id,
+      fromNumber,
+      "sms",
+      "assistant",
+      aiReply
+    );
 
-      // Store AI reply
-      await storeConversation(
-        business.id,
-        fromNumber,
-        "sms",
-        "assistant",
-        aiReply
-      );
-    }
-
-    const twiml = `
-<Response>
-  <Message>${aiReply}</Message>
-</Response>
-    `;
-
-    res.type("text/xml").send(twiml);
-  } catch (error) {
-    console.error("SMS error:", error.message);
-
-    res.type("text/xml").send(`
-<Response>
-  <Message>Sorry, something went wrong.</Message>
-</Response>
+    res.send(`
+      <Response>
+        <Message>${aiReply}</Message>
+      </Response>
     `);
+  } catch (err) {
+    console.error("SMS error:", err.message);
+    res.send("Something went wrong.");
   }
 });
 
-const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
