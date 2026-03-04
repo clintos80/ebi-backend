@@ -28,16 +28,16 @@ const openai = new OpenAI({
 });
 
 /* ===============================
-   HELPERS
+   DATABASE HELPERS
 ================================= */
 
-// Get business by Twilio number
 async function getBusinessByPhone(phoneNumber) {
   const { data, error } = await supabase
     .from("businesses")
     .select("*")
     .eq("phone_number", phoneNumber)
-    .single();
+    .limit(1)
+    .maybeSingle();
 
   if (error) {
     console.error("Business lookup error:", error.message);
@@ -47,26 +47,53 @@ async function getBusinessByPhone(phoneNumber) {
   return data;
 }
 
-// Store conversation
-async function storeConversation(businessId, userPhone, channel, message) {
+async function storeConversation(
+  businessId,
+  userPhone,
+  channel,
+  role,
+  message
+) {
   await supabase.from("conversations").insert([
     {
       business_id: businessId,
       user_phone: userPhone,
       channel,
+      role,
       message,
     },
   ]);
 }
 
-// Generate AI reply
-async function generateAIReply(systemPrompt, userInput) {
+async function getConversationHistory(businessId, userPhone) {
+  const { data } = await supabase
+    .from("conversations")
+    .select("role, message")
+    .eq("business_id", businessId)
+    .eq("user_phone", userPhone)
+    .order("created_at", { ascending: true })
+    .limit(10);
+
+  return data || [];
+}
+
+/* ===============================
+   AI GENERATION
+================================= */
+
+async function generateAIReply(systemPrompt, history, userInput) {
+  const messages = [
+    { role: "system", content: systemPrompt },
+    ...history.map((msg) => ({
+      role: msg.role,
+      content: msg.message,
+    })),
+    { role: "user", content: userInput },
+  ];
+
   const completion = await openai.chat.completions.create({
     model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userInput },
-    ],
+    messages,
   });
 
   return completion.choices[0].message.content;
@@ -80,13 +107,10 @@ app.get("/", (req, res) => {
   res.send("Ebi SaaS backend is running");
 });
 
-// Voice start
-app.post("/voice", async (req, res) => {
-  console.log("Twilio To:", req.body.To);
-  console.log("Twilio From:", req.body.From);
-  
-  const toNumber = req.body.To;
+/* ========= VOICE START ========= */
 
+app.post("/voice", async (req, res) => {
+  const toNumber = req.body.To;
   const business = await getBusinessByPhone(toNumber);
 
   if (!business) {
@@ -99,7 +123,10 @@ app.post("/voice", async (req, res) => {
 
   const twiml = `
 <Response>
-  <Say>Hello, thank you for calling ${business.business_name}. How can I help you today?</Say>
+  <Say voice="Polly.Joanna-Neural">
+    Hello, thank you for calling ${business.business_name}.
+    How can I help you today?
+  </Say>
   <Gather input="speech" action="/process" method="POST" timeout="5" />
 </Response>
   `;
@@ -107,7 +134,8 @@ app.post("/voice", async (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// Voice process
+/* ========= VOICE PROCESS ========= */
+
 app.post("/process", async (req, res) => {
   try {
     const userSpeech = req.body.SpeechResult;
@@ -127,8 +155,28 @@ app.post("/process", async (req, res) => {
     let aiReply = "Sorry, I didn't catch that.";
 
     if (userSpeech) {
+
+      // Immediately respond to avoid silence
+      const holdMessage = `
+<Response>
+  <Say voice="Polly.Joanna-Neural">
+    Please hold while I check that for you.
+  </Say>
+  <Pause length="1"/>
+</Response>
+      `;
+
+      res.type("text/xml").send(holdMessage);
+
+      // Now continue AI processing in background
+      const history = await getConversationHistory(
+        business.id,
+        fromNumber
+      );
+
       aiReply = await generateAIReply(
         business.system_prompt,
+        history,
         userSpeech
       );
 
@@ -136,30 +184,28 @@ app.post("/process", async (req, res) => {
         business.id,
         fromNumber,
         "voice",
+        "user",
         userSpeech
       );
+
+      await storeConversation(
+        business.id,
+        fromNumber,
+        "voice",
+        "assistant",
+        aiReply
+      );
+
+      return;
     }
 
-    const twiml = `
-<Response>
-  <Say>${aiReply}</Say>
-  <Gather input="speech" action="/process" method="POST" timeout="5" />
-</Response>
-    `;
-
-    res.type("text/xml").send(twiml);
   } catch (error) {
     console.error("Voice error:", error.message);
-
-    res.type("text/xml").send(`
-<Response>
-  <Say>Sorry, something went wrong.</Say>
-</Response>
-    `);
   }
 });
 
-// SMS
+/* ========= SMS ========= */
+
 app.post("/sms", async (req, res) => {
   try {
     const userMessage = req.body.Body;
@@ -179,8 +225,14 @@ app.post("/sms", async (req, res) => {
     let aiReply = "Sorry, I didn't understand that.";
 
     if (userMessage) {
+      const history = await getConversationHistory(
+        business.id,
+        fromNumber
+      );
+
       aiReply = await generateAIReply(
         business.system_prompt,
+        history,
         userMessage
       );
 
@@ -188,7 +240,16 @@ app.post("/sms", async (req, res) => {
         business.id,
         fromNumber,
         "sms",
+        "user",
         userMessage
+      );
+
+      await storeConversation(
+        business.id,
+        fromNumber,
+        "sms",
+        "assistant",
+        aiReply
       );
     }
 
@@ -199,6 +260,7 @@ app.post("/sms", async (req, res) => {
     `;
 
     res.type("text/xml").send(twiml);
+
   } catch (error) {
     console.error("SMS error:", error.message);
 
