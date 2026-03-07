@@ -12,12 +12,9 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-/* ===============================
-   Clients
-================================= */
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SECRET_KEY 
+  process.env.SUPABASE_SECRET_KEY
 );
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -39,11 +36,19 @@ function escapeXml(unsafe) {
     .replaceAll("'", "&apos;");
 }
 
+function renderTemplate(template, vars) {
+  let output = template || "";
+  for (const [key, value] of Object.entries(vars)) {
+    output = output.replaceAll(`{{${key}}}`, String(value ?? ""));
+  }
+  return output;
+}
+
 /* ===============================
-   Latency Trick #1: Business cache
+   Business cache
 ================================= */
 const BUSINESS_CACHE_TTL_MS = 10 * 60 * 1000;
-const businessCache = new Map(); // toNumber -> { business, expiresAt }
+const businessCache = new Map();
 
 async function getBusinessByPhoneNumber(toNumber) {
   const cached = businessCache.get(toNumber);
@@ -72,35 +77,23 @@ async function getBusinessByPhoneNumber(toNumber) {
 }
 
 /* ===============================
-   Latency Trick #2: In-memory voice session history (per CallSid)
+   Voice session memory
 ================================= */
-const voiceSessionHistory = new Map(); // callSid -> [{role,message}]
+const voiceSessionHistory = new Map();
 const VOICE_SESSION_TTL_MS = 20 * 60 * 1000;
 const voiceSessionExpiry = new Map();
 
 function touchVoiceSession(callSid) {
   voiceSessionExpiry.set(callSid, Date.now() + VOICE_SESSION_TTL_MS);
 }
-function cleanupExpiredSessions() {
-  const now = Date.now();
-  for (const [sid, exp] of voiceSessionExpiry.entries()) {
-    if (exp <= now) {
-      voiceSessionExpiry.delete(sid);
-      voiceSessionHistory.delete(sid);
-      callState.delete(sid);
-    }
-  }
-}
-setInterval(cleanupExpiredSessions, 60 * 1000).unref();
 
-/* ===============================
-   Call state: filler + silence retries
-================================= */
-const callState = new Map(); // callSid -> { lastFiller: string, silenceCount: number }
+const callState = new Map();
 
 function getCallState(callSid) {
   if (!callSid) return { lastFiller: "", silenceCount: 0 };
-  if (!callState.has(callSid)) callState.set(callSid, { lastFiller: "", silenceCount: 0 });
+  if (!callState.has(callSid)) {
+    callState.set(callSid, { lastFiller: "", silenceCount: 0 });
+  }
   return callState.get(callSid);
 }
 
@@ -108,14 +101,10 @@ function pickFiller(callSid, userSpeech) {
   const state = getCallState(callSid);
   const text = (userSpeech || "").trim().toLowerCase();
 
-  // Short answers like: "Panania", "Yes", "Clinton", "Tomorrow 5pm"
   const looksLikeShortAnswer = text.length <= 18;
-
-  // Looks like a suburb/location: "I'm in Panania" OR just "Panania"
   const looksLikeLocation =
     /\b(i'?m in|im in|in|at)\b/.test(text) || /^[a-z\s-]{3,25}$/.test(text);
 
-  // If it doesn't sound like a problem description, acknowledge instead of "checking"
   const shortAck = ["Perfect, thanks.", "Got it.", "Okay, noted.", "Great, thanks."];
   const thinking = ["Alright — one sec.", "Thanks — just a moment.", "Okay — give me a second."];
 
@@ -130,17 +119,37 @@ function pickFiller(callSid, userSpeech) {
   return chosen;
 }
 
+function cleanupExpiredSessions() {
+  const now = Date.now();
+  for (const [sid, exp] of voiceSessionExpiry.entries()) {
+    if (exp <= now) {
+      voiceSessionExpiry.delete(sid);
+      voiceSessionHistory.delete(sid);
+      callState.delete(sid);
+    }
+  }
+}
+setInterval(cleanupExpiredSessions, 60 * 1000).unref();
+
 /* ===============================
-   DB Helpers
+   DB helpers
 ================================= */
 async function storeConversation(businessId, userPhone, channel, role, message, callSid = null) {
   const { error } = await supabase.from("conversations").insert([
-    { business_id: businessId, user_phone: userPhone, channel, role, message, call_sid: callSid },
+    {
+      business_id: businessId,
+      user_phone: userPhone,
+      channel,
+      role,
+      message,
+      call_sid: callSid,
+    },
   ]);
+
   if (error) console.error("Store conversation error:", error.message);
 }
 
-async function upsertVoiceLead(businessId, callSid, lead, customerPhone) {
+async function upsertVoiceLead(businessId, callSid, lead, customerPhone, entryType = "direct") {
   if (!callSid) return;
 
   const payload = {
@@ -156,6 +165,8 @@ async function upsertVoiceLead(businessId, callSid, lead, customerPhone) {
     preferred_time: lead.preferred_time || null,
     notes: lead.notes || null,
     status: lead.status || (lead.lead_ready ? "new" : "in_progress"),
+    lead_ready: Boolean(lead.lead_ready),
+    entry_type: entryType,
   };
 
   const { error } = await supabase
@@ -165,7 +176,38 @@ async function upsertVoiceLead(businessId, callSid, lead, customerPhone) {
   if (error) console.error("Lead upsert error:", error.message);
 }
 
-// Claim notification once (atomic)
+async function insertSmsLead(businessId, customerPhone, lead) {
+  const payload = {
+    business_id: businessId,
+    source: "sms",
+    call_sid: null,
+    customer_phone: customerPhone || lead.customer_phone || null,
+    customer_name: lead.customer_name || null,
+    suburb: lead.suburb || null,
+    address: lead.address || null,
+    job_type: lead.job_type || null,
+    urgency: lead.urgency || null,
+    preferred_time: lead.preferred_time || null,
+    notes: lead.notes || null,
+    status: lead.status || "new",
+    lead_ready: Boolean(lead.lead_ready),
+    entry_type: "direct",
+  };
+
+  const { data, error } = await supabase
+    .from("leads")
+    .insert([payload])
+    .select("*")
+    .maybeSingle();
+
+  if (error) {
+    console.error("SMS lead insert error:", error.message);
+    return null;
+  }
+
+  return data;
+}
+
 async function claimVoiceNotification(businessId, callSid) {
   const { data, error } = await supabase
     .from("leads")
@@ -180,6 +222,7 @@ async function claimVoiceNotification(businessId, callSid) {
     console.error("Claim notify error:", error.message);
     return null;
   }
+
   return data;
 }
 
@@ -198,7 +241,7 @@ async function updateLeadCalendarInfo(businessId, callSid, calendarEventId, note
 }
 
 /* ===============================
-   OpenAI: Strict JSON schema output
+   OpenAI structured extraction
 ================================= */
 const LEAD_REPLY_SCHEMA = {
   name: "lead_reply",
@@ -272,7 +315,7 @@ Style rules:
 - 1–2 short sentences.
 - Ask for at most ONE missing field per turn.
 - Do not repeat the same question if you already asked it in the last assistant message.
-- If the caller doesn't know the fault, ask symptom-based options (power outage, tripping switch, flickering, sparks, burning smell).
+- If the caller doesn't know the fault, ask symptom-based options like power outage, tripping switch, flickering lights, sparks, or burning smell.
 - If lead_ready=true: confirm briefly and say someone will confirm shortly.
 
 lead_ready=true only when you have:
@@ -281,7 +324,11 @@ customer_name + job_type + urgency + preferred_time + (suburb OR address).`;
   const completion = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     response_format: { type: "json_schema", json_schema: LEAD_REPLY_SCHEMA },
-    messages: [{ role: "system", content: system }, ...cleanedHistory, { role: "user", content: userInput }],
+    messages: [
+      { role: "system", content: system },
+      ...cleanedHistory,
+      { role: "user", content: userInput },
+    ],
   });
 
   const raw = completion.choices?.[0]?.message?.content || "{}";
@@ -289,7 +336,7 @@ customer_name + job_type + urgency + preferred_time + (suburb OR address).`;
 }
 
 /* ===============================
-   Google Calendar OAuth + Events
+   Google Calendar
 ================================= */
 function getOAuthClient() {
   return new google.auth.OAuth2(
@@ -299,7 +346,6 @@ function getOAuthClient() {
   );
 }
 
-// OAuth start: identify business by phone_number query param
 app.get("/auth/google/start", async (req, res) => {
   try {
     let phoneNumber = req.query.phone_number;
@@ -341,7 +387,10 @@ app.get("/auth/google/callback", async (req, res) => {
 
     const { error } = await supabase
       .from("businesses")
-      .update({ gcal_refresh_token: tokens.refresh_token, gcal_calendar_id: "primary" })
+      .update({
+        gcal_refresh_token: tokens.refresh_token,
+        gcal_calendar_id: "primary",
+      })
       .eq("id", businessId);
 
     if (error) {
@@ -358,10 +407,11 @@ app.get("/auth/google/callback", async (req, res) => {
 
 function parsePreferredTime(preferredTime, tz) {
   if (!preferredTime) return null;
+
   const zone = tz || "Australia/Sydney";
   const base = DateTime.now().setZone(zone).toJSDate();
-
   const results = chrono.parse(preferredTime, base);
+
   if (!results || results.length === 0) return null;
 
   const d = results[0].start?.date();
@@ -369,6 +419,7 @@ function parsePreferredTime(preferredTime, tz) {
 
   const start = DateTime.fromJSDate(d).setZone(zone);
   const end = start.plus({ hours: 1 });
+
   return { start, end, zone };
 }
 
@@ -416,7 +467,7 @@ async function createCalendarEventBestEffort(business, lead, customerPhone) {
 }
 
 /* ===============================
-   Twilio SMS notify (best effort)
+   Twilio SMS
 ================================= */
 async function sendOwnerSmsBestEffort(business, lead, customerPhone) {
   try {
@@ -448,8 +499,35 @@ async function sendOwnerSmsBestEffort(business, lead, customerPhone) {
   }
 }
 
+async function sendRecoverySmsBestEffort(business, callerPhone) {
+  try {
+    if (!twilioClient) return { ok: false, reason: "twilio_not_configured" };
+    if (!process.env.TWILIO_FROM_NUMBER) return { ok: false, reason: "no_from_number" };
+    if (!callerPhone) return { ok: false, reason: "no_caller_phone" };
+
+    const template =
+      business.missed_call_sms_template ||
+      "Hi, this is Ebi from {{business_name}}. Sorry we missed your call. What electrical issue are you experiencing?";
+
+    const body = renderTemplate(template, {
+      business_name: business.business_name || "our team",
+    });
+
+    await twilioClient.messages.create({
+      from: process.env.TWILIO_FROM_NUMBER,
+      to: callerPhone,
+      body,
+    });
+
+    return { ok: true };
+  } catch (e) {
+    console.error("Recovery SMS failed:", e.message);
+    return { ok: false, reason: "recovery_sms_error" };
+  }
+}
+
 /* ===============================
-   Post-lead actions (voice) — BEST EFFORT
+   Voice post-actions
 ================================= */
 async function runPostLeadActionsVoice({ business, callSid, lead, fromNumber }) {
   try {
@@ -473,15 +551,24 @@ async function runPostLeadActionsVoice({ business, callSid, lead, fromNumber }) 
 /* ===============================
    Routes
 ================================= */
-app.get("/", (req, res) => res.send("Ebi backend is running"));
+app.get("/", (req, res) => {
+  res.send("Ebi backend is running");
+});
 
-/* ========= VOICE ENTRY ========= */
+/* ========= VOICE ENTRY =========
+   Supports both:
+   - direct calls to Twilio number
+   - forwarded calls from electrician's own number
+================================= */
 app.post("/voice", async (req, res) => {
   const toNumber = req.body.To;
   const business = await getBusinessByPhoneNumber(toNumber);
 
   if (!business) {
-    return res.type("text/xml").send(`<Response><Say>Sorry, this number is not configured.</Say></Response>`);
+    return res.type("text/xml").send(`
+<Response>
+  <Say>Sorry, this number is not configured.</Say>
+</Response>`);
   }
 
   return res.type("text/xml").send(`
@@ -493,11 +580,7 @@ app.post("/voice", async (req, res) => {
 </Response>`);
 });
 
-/* ========= FAST STEP: /process =========
-   - Handles silence retries
-   - Uses context-aware filler (not repetitive / not weird for suburb)
-   - Redirects to /process2 for AI
-========================================= */
+/* ========= FAST STEP ========= */
 app.post("/process", async (req, res) => {
   try {
     const toNumber = req.body.To;
@@ -507,12 +590,14 @@ app.post("/process", async (req, res) => {
 
     const business = await getBusinessByPhoneNumber(toNumber);
     if (!business) {
-      return res.type("text/xml").send(`<Response><Say>Sorry, this number is not configured.</Say></Response>`);
+      return res.type("text/xml").send(`
+<Response>
+  <Say>Sorry, this number is not configured.</Say>
+</Response>`);
     }
 
     const state = getCallState(callSid);
 
-    // Silence / stutter / no transcript
     if (!userSpeech) {
       state.silenceCount += 1;
 
@@ -538,13 +623,10 @@ app.post("/process", async (req, res) => {
 </Response>`);
     }
 
-    // reset silence count once we get speech
     state.silenceCount = 0;
 
-    // Persist user msg async
     void storeConversation(business.id, fromNumber, "voice", "user", userSpeech, callSid);
 
-    // Update session history quickly so /process2 can use it
     const sessionKey = callSid || `voice:${fromNumber}`;
     const currentHistory = voiceSessionHistory.get(sessionKey) || [];
     touchVoiceSession(sessionKey);
@@ -552,7 +634,6 @@ app.post("/process", async (req, res) => {
     const nextHistory = [...currentHistory, { role: "user", message: userSpeech }].slice(-10);
     voiceSessionHistory.set(sessionKey, nextHistory);
 
-    // Context-aware filler
     const filler = pickFiller(callSid, userSpeech);
 
     return res.type("text/xml").send(`
@@ -562,20 +643,27 @@ app.post("/process", async (req, res) => {
 </Response>`);
   } catch (err) {
     console.error("Voice /process error:", err.message);
-    return res.type("text/xml").send(`<Response><Say>Sorry, something went wrong.</Say></Response>`);
+    return res.type("text/xml").send(`
+<Response>
+  <Say>Sorry, something went wrong.</Say>
+</Response>`);
   }
 });
 
-/* ========= AI STEP: /process2 ========= */
+/* ========= AI STEP ========= */
 app.post("/process2", async (req, res) => {
   try {
     const toNumber = req.body.To;
     const fromNumber = req.body.From;
     const callSid = req.body.CallSid;
+    const forwardedFrom = req.body.ForwardedFrom || null;
 
     const business = await getBusinessByPhoneNumber(toNumber);
     if (!business) {
-      return res.type("text/xml").send(`<Response><Say>Sorry, this number is not configured.</Say></Response>`);
+      return res.type("text/xml").send(`
+<Response>
+  <Say>Sorry, this number is not configured.</Say>
+</Response>`);
     }
 
     const sessionKey = callSid || `voice:${fromNumber}`;
@@ -598,31 +686,94 @@ app.post("/process2", async (req, res) => {
     const reply = (assistantJson.reply || "").trim() || "Thanks—what suburb are you in?";
     const leadReady = Boolean(assistantJson.lead_ready);
     const lead = assistantJson.lead || {};
+    const entryType = forwardedFrom ? "forwarded" : "direct";
 
-    // Update session history
     const nextHistory = [...currentHistory, { role: "assistant", message: reply }].slice(-10);
     voiceSessionHistory.set(sessionKey, nextHistory);
 
-    // Persist assistant async
     void storeConversation(business.id, fromNumber, "voice", "assistant", reply, callSid);
 
-    // Upsert lead async
-    void upsertVoiceLead(business.id, callSid, { ...lead, lead_ready: leadReady }, fromNumber);
+    void upsertVoiceLead(
+      business.id,
+      callSid,
+      { ...lead, lead_ready: leadReady },
+      fromNumber,
+      entryType
+    );
 
-    // Respond to Twilio
     res.type("text/xml").send(`
 <Response>
   <Say voice="Polly.Joanna-Neural">${escapeXml(reply)}</Say>
   <Gather input="speech" action="/process" method="POST" timeout="7" speechTimeout="auto" actionOnEmptyResult="true" />
 </Response>`);
 
-    // Post actions in background
     if (leadReady && callSid) {
       void runPostLeadActionsVoice({ business, callSid, lead, fromNumber });
     }
   } catch (err) {
     console.error("Voice /process2 error:", err.message);
-    return res.type("text/xml").send(`<Response><Say>Sorry, something went wrong.</Say></Response>`);
+    return res.type("text/xml").send(`
+<Response>
+  <Say>Sorry, something went wrong.</Say>
+</Response>`);
+  }
+});
+
+/* ========= CALL STATUS =========
+   Send recovery SMS if call ended without a completed lead
+================================= */
+app.post("/voice-status", async (req, res) => {
+  try {
+    const callSid = req.body.CallSid;
+    const callStatus = req.body.CallStatus;
+    const toNumber = req.body.To;
+    const fromNumber = req.body.From;
+
+    if (!callSid || callStatus !== "completed") {
+      return res.status(200).send("ok");
+    }
+
+    const business = await getBusinessByPhoneNumber(toNumber);
+    if (!business) {
+      return res.status(200).send("ok");
+    }
+
+    if (!business.missed_call_sms_enabled) {
+      return res.status(200).send("ok");
+    }
+
+    const { data: lead, error } = await supabase
+      .from("leads")
+      .select("id,lead_ready,recovery_sms_sent")
+      .eq("business_id", business.id)
+      .eq("call_sid", callSid)
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      console.error("Voice status lead lookup error:", error.message);
+      return res.status(200).send("ok");
+    }
+
+    if (!lead) {
+      return res.status(200).send("ok");
+    }
+
+    if (lead.lead_ready || lead.recovery_sms_sent) {
+      return res.status(200).send("ok");
+    }
+
+    await sendRecoverySmsBestEffort(business, fromNumber);
+
+    await supabase
+      .from("leads")
+      .update({ recovery_sms_sent: true })
+      .eq("id", lead.id);
+
+    return res.status(200).send("ok");
+  } catch (e) {
+    console.error("Voice status error:", e.message);
+    return res.status(200).send("ok");
   }
 });
 
@@ -635,11 +786,17 @@ app.post("/sms", async (req, res) => {
 
     const business = await getBusinessByPhoneNumber(toNumber);
     if (!business) {
-      return res.type("text/xml").send(`<Response><Message>Sorry, this number is not configured.</Message></Response>`);
+      return res.type("text/xml").send(`
+<Response>
+  <Message>Sorry, this number is not configured.</Message>
+</Response>`);
     }
 
     if (!userMessage) {
-      return res.type("text/xml").send(`<Response><Message>Sorry, I didn’t catch that.</Message></Response>`);
+      return res.type("text/xml").send(`
+<Response>
+  <Message>Sorry, I didn’t catch that.</Message>
+</Response>`);
     }
 
     void storeConversation(business.id, fromNumber, "sms", "user", userMessage, null);
@@ -660,18 +817,29 @@ app.post("/sms", async (req, res) => {
 
     void storeConversation(business.id, fromNumber, "sms", "assistant", reply, null);
 
-    res.type("text/xml").send(`<Response><Message>${escapeXml(reply)}</Message></Response>`);
+    res.type("text/xml").send(`
+<Response>
+  <Message>${escapeXml(reply)}</Message>
+</Response>`);
 
-    // Best effort follow-up
     if (leadReady) {
       void sendOwnerSmsBestEffort(business, lead, fromNumber);
       void createCalendarEventBestEffort(business, lead, fromNumber);
+      void insertSmsLead(business.id, fromNumber, {
+        ...lead,
+        lead_ready: true,
+      });
     }
   } catch (err) {
     console.error("SMS error:", err.message);
-    return res.type("text/xml").send(`<Response><Message>Sorry, something went wrong.</Message></Response>`);
+    return res.type("text/xml").send(`
+<Response>
+  <Message>Sorry, something went wrong.</Message>
+</Response>`);
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
