@@ -556,14 +556,19 @@ async function runPostLeadActionsVoice({ business, callSid, lead, fromNumber }) 
   try {
     const claimed = await claimVoiceNotification(business.id, callSid);
     if (!claimed) return;
+    const usageState = await getBusinessUsageState(business.id);
 
     const cal = await createCalendarEventBestEffort(business, lead, fromNumber);
-    if (cal.ok) {
-      await updateLeadCalendarInfo(business.id, callSid, cal.eventId, claimed.notes ?? undefined);
-    } else if (cal.reason === "time_unparseable") {
-      const append = `${(claimed.notes || "").trim()}\nPreferred time unclear: ${lead.preferred_time || ""}`.trim();
-      await updateLeadCalendarInfo(business.id, callSid, undefined, append);
-    }
+    if (usageState?.canUseCalendarBooking) {
+  const cal = await createCalendarEventBestEffort(business, lead, fromNumber);
+
+  if (cal.ok) {
+    await updateLeadCalendarInfo(business.id, callSid, cal.eventId, claimed.notes ?? undefined);
+  } else if (cal.reason === "time_unparseable") {
+    const append = `${(claimed.notes || "").trim()}\nPreferred time unclear: ${lead.preferred_time || ""}`.trim();
+    await updateLeadCalendarInfo(business.id, callSid, undefined, append);
+  }
+}
 
     await sendOwnerSmsBestEffort(business, lead, fromNumber);
   } catch (e) {
@@ -617,6 +622,109 @@ async function updateBusinessSubscriptionByBusinessId(businessId, patch) {
   if (error) {
     console.error("Update business subscription by business error:", error.message);
   }
+}
+
+/* ========= Plan Limit Helpers ========= */
+function getCurrentPeriodMonth() {
+  const now = new Date();
+  const year = now.getUTCFullYear();
+  const month = String(now.getUTCMonth() + 1).padStart(2, "0");
+  return `${year}-${month}`;
+}
+
+function getPlanVoiceCallLimit(planKey) {
+  if (planKey === "pro") return 600;
+  return 150; // starter default
+}
+
+function isProPlan(planKey) {
+  return planKey === "pro";
+}
+
+/* ========= Usage Counter Helpers ========= */
+async function getUsageCounter(businessId, metric, periodMonth) {
+  const { data, error } = await supabase
+    .from("usage_counters")
+    .select("*")
+    .eq("business_id", businessId)
+    .eq("metric", metric)
+    .eq("period_month", periodMonth)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.error("Get usage counter error:", error.message);
+    return null;
+  }
+
+  return data;
+}
+
+async function incrementUsageCounter(businessId, metric, periodMonth, amount = 1) {
+  const existing = await getUsageCounter(businessId, metric, periodMonth);
+
+  if (!existing) {
+    const { error } = await supabase.from("usage_counters").insert([
+      {
+        business_id: businessId,
+        metric,
+        period_month: periodMonth,
+        value: amount,
+      },
+    ]);
+
+    if (error) {
+      console.error("Insert usage counter error:", error.message);
+    }
+
+    return;
+  }
+
+  const { error } = await supabase
+    .from("usage_counters")
+    .update({
+      value: existing.value + amount,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", existing.id);
+
+  if (error) {
+    console.error("Update usage counter error:", error.message);
+  }
+}
+
+/* ========= Feature Access Helper ========= */
+async function getBusinessUsageState(businessId) {
+  const { data: business, error } = await supabase
+    .from("businesses")
+    .select("id,plan_key,subscription_status")
+    .eq("id", businessId)
+    .limit(1)
+    .maybeSingle();
+
+  if (error || !business) {
+    console.error("Get business usage state error:", error?.message || "Business not found");
+    return null;
+  }
+
+  const periodMonth = getCurrentPeriodMonth();
+  const usage = await getUsageCounter(businessId, "voice_calls", periodMonth);
+
+  const usedCalls = usage?.value || 0;
+  const limit = getPlanVoiceCallLimit(business.plan_key);
+  const remainingCalls = Math.max(limit - usedCalls, 0);
+
+  return {
+    planKey: business.plan_key || "starter",
+    subscriptionStatus: business.subscription_status || "inactive",
+    usedCalls,
+    limit,
+    remainingCalls,
+    canUseCalendarBooking:
+      business.subscription_status === "active" && isProPlan(business.plan_key),
+    isVoiceLimitExceeded:
+      business.subscription_status === "active" ? usedCalls >= limit : true,
+  };
 }
 
 /* ===============================
@@ -801,6 +909,8 @@ app.post("/voice-status", async (req, res) => {
     const fromNumber = req.body.From;
 
     if (!callSid || callStatus !== "completed") {
+      const periodMonth = getCurrentPeriodMonth();
+      await incrementUsageCounter(business.id, "voice_calls", periodMonth, 1);
       return res.status(200).send("ok");
     }
 
