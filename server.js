@@ -45,7 +45,6 @@ const twilioClient =
     ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
     : null;
 
-const Stripe = require("stripe");
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);    
 
 /* ===============================
