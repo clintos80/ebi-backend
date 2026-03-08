@@ -556,19 +556,33 @@ async function runPostLeadActionsVoice({ business, callSid, lead, fromNumber }) 
   try {
     const claimed = await claimVoiceNotification(business.id, callSid);
     if (!claimed) return;
+
     const usageState = await getBusinessUsageState(business.id);
 
-    const cal = await createCalendarEventBestEffort(business, lead, fromNumber);
+    // Only Pro users get calendar booking
     if (usageState?.canUseCalendarBooking) {
-  const cal = await createCalendarEventBestEffort(business, lead, fromNumber);
+      const cal = await createCalendarEventBestEffort(business, lead, fromNumber);
 
-  if (cal.ok) {
-    await updateLeadCalendarInfo(business.id, callSid, cal.eventId, claimed.notes ?? undefined);
-  } else if (cal.reason === "time_unparseable") {
-    const append = `${(claimed.notes || "").trim()}\nPreferred time unclear: ${lead.preferred_time || ""}`.trim();
-    await updateLeadCalendarInfo(business.id, callSid, undefined, append);
-  }
-}
+      if (cal.ok) {
+        await updateLeadCalendarInfo(
+          business.id,
+          callSid,
+          cal.eventId,
+          claimed.notes ?? undefined
+        );
+      } else if (cal.reason === "time_unparseable") {
+        const append = `${(claimed.notes || "").trim()}\nPreferred time unclear: ${
+          lead.preferred_time || ""
+        }`.trim();
+
+        await updateLeadCalendarInfo(
+          business.id,
+          callSid,
+          undefined,
+          append
+        );
+      }
+    }
 
     await sendOwnerSmsBestEffort(business, lead, fromNumber);
   } catch (e) {
@@ -909,8 +923,6 @@ app.post("/voice-status", async (req, res) => {
     const fromNumber = req.body.From;
 
     if (!callSid || callStatus !== "completed") {
-      const periodMonth = getCurrentPeriodMonth();
-      await incrementUsageCounter(business.id, "voice_calls", periodMonth, 1);
       return res.status(200).send("ok");
     }
 
@@ -918,6 +930,10 @@ app.post("/voice-status", async (req, res) => {
     if (!business) {
       return res.status(200).send("ok");
     }
+
+    // Count completed voice calls
+    const periodMonth = getCurrentPeriodMonth();
+    await incrementUsageCounter(business.id, "voice_calls", periodMonth, 1);
 
     if (!business.missed_call_sms_enabled) {
       return res.status(200).send("ok");
