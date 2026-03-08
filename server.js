@@ -10,7 +10,14 @@ const twilio = require("twilio");
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+
+app.use((req, res, next) => {
+  if (req.originalUrl === "/billing/webhook") {
+    next();
+  } else {
+    express.json()(req, res, next);
+  }
+});
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -567,6 +574,38 @@ async function getBusinessForBilling(userId) {
   return data;
 }
 
+function getPlanKeyFromPriceId(priceId) {
+  if (priceId === process.env.STRIPE_PRICE_PRO) return "pro";
+  return "starter";
+}
+
+function toIsoFromUnix(seconds) {
+  if (!seconds) return null;
+  return new Date(seconds * 1000).toISOString();
+}
+
+async function updateBusinessSubscriptionByCustomerId(customerId, patch) {
+  const { error } = await supabase
+    .from("businesses")
+    .update(patch)
+    .eq("stripe_customer_id", customerId);
+
+  if (error) {
+    console.error("Update business subscription by customer error:", error.message);
+  }
+}
+
+async function updateBusinessSubscriptionByBusinessId(businessId, patch) {
+  const { error } = await supabase
+    .from("businesses")
+    .update(patch)
+    .eq("id", businessId);
+
+  if (error) {
+    console.error("Update business subscription by business error:", error.message);
+  }
+}
+
 /* ===============================
    Routes
 ================================= */
@@ -857,6 +896,111 @@ app.post("/sms", async (req, res) => {
 </Response>`);
   }
 });
+
+app.post(
+  "/billing/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    let event;
+
+    try {
+      const signature = req.headers["stripe-signature"];
+
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error("Stripe webhook signature verification failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    try {
+      switch (event.type) {
+        case "checkout.session.completed": {
+          const session = event.data.object;
+
+          if (session.mode === "subscription") {
+            const businessId = session.metadata?.business_id || null;
+            const customerId = session.customer || null;
+            const subscriptionId = session.subscription || null;
+            const planKey = session.metadata?.plan_key || "starter";
+            const billingEmail =
+              session.customer_details?.email || session.customer_email || null;
+
+            if (businessId) {
+              await updateBusinessSubscriptionByBusinessId(businessId, {
+                stripe_customer_id: customerId,
+                stripe_subscription_id: subscriptionId,
+                billing_email: billingEmail,
+                plan_key: planKey,
+              });
+            }
+          }
+
+          break;
+        }
+
+        case "customer.subscription.created":
+        case "customer.subscription.updated": {
+          const subscription = event.data.object;
+
+          const customerId = subscription.customer;
+          const subscriptionId = subscription.id;
+          const status = subscription.status;
+          const currentPeriodEnd = toIsoFromUnix(subscription.current_period_end);
+
+          const priceId =
+            subscription.items?.data?.[0]?.price?.id || null;
+
+          const planKey = getPlanKeyFromPriceId(priceId);
+
+          await updateBusinessSubscriptionByCustomerId(customerId, {
+            stripe_subscription_id: subscriptionId,
+            subscription_status: status,
+            plan_key: planKey,
+            current_period_end: currentPeriodEnd,
+          });
+
+          break;
+        }
+
+        case "customer.subscription.deleted": {
+          const subscription = event.data.object;
+
+          await updateBusinessSubscriptionByCustomerId(subscription.customer, {
+            stripe_subscription_id: subscription.id,
+            subscription_status: "canceled",
+            current_period_end: toIsoFromUnix(subscription.current_period_end),
+          });
+
+          break;
+        }
+
+        case "invoice.payment_failed": {
+          const invoice = event.data.object;
+
+          if (invoice.customer) {
+            await updateBusinessSubscriptionByCustomerId(invoice.customer, {
+              subscription_status: "past_due",
+            });
+          }
+
+          break;
+        }
+
+        default:
+          break;
+      }
+
+      return res.json({ received: true });
+    } catch (err) {
+      console.error("Stripe webhook handler error:", err.message);
+      return res.status(500).json({ error: "Webhook handler failed" });
+    }
+  }
+);
 
 app.post("/billing/create-checkout-session", async (req, res) => {
   try {
