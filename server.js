@@ -1,14 +1,28 @@
 require("dotenv").config();
 
 const express = require("express");
+const cors = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 const OpenAI = require("openai");
 const { google } = require("googleapis");
 const chrono = require("chrono-node");
 const { DateTime } = require("luxon");
 const twilio = require("twilio");
+const Stripe = require("stripe");
 
 const app = express();
+
+app.use(
+  cors({
+    origin: [
+      "http://localhost:3000",
+      "https://ebi-dashboard.vercel.app",
+    ],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    credentials: false,
+  })
+);
+
 app.use(express.urlencoded({ extended: true }));
 
 app.use((req, res, next) => {
