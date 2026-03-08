@@ -24,6 +24,9 @@ const twilioClient =
     ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
     : null;
 
+const Stripe = require("stripe");
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);    
+
 /* ===============================
    Utilities
 ================================= */
@@ -548,6 +551,22 @@ async function runPostLeadActionsVoice({ business, callSid, lead, fromNumber }) 
   }
 }
 
+async function getBusinessForBilling(userId) {
+  const { data, error } = await supabase
+    .from("businesses")
+    .select("*")
+    .eq("owner_user_id", userId)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.error("Billing business lookup error:", error.message);
+    return null;
+  }
+
+  return data;
+}
+
 /* ===============================
    Routes
 ================================= */
@@ -836,6 +855,77 @@ app.post("/sms", async (req, res) => {
 <Response>
   <Message>Sorry, something went wrong.</Message>
 </Response>`);
+  }
+});
+
+app.post("/billing/create-checkout-session", async (req, res) => {
+  try {
+    const { userId, planKey } = req.body;
+
+    if (!userId || !planKey) {
+      return res.status(400).json({ error: "Missing userId or planKey" });
+    }
+
+    if (!["starter", "pro"].includes(planKey)) {
+      return res.status(400).json({ error: "Invalid planKey" });
+    }
+
+    const business = await getBusinessForBilling(userId);
+    if (!business) {
+      return res.status(404).json({ error: "Business not found" });
+    }
+
+    const priceId =
+      planKey === "pro"
+        ? process.env.STRIPE_PRICE_PRO
+        : process.env.STRIPE_PRICE_STARTER;
+
+    if (!priceId) {
+      return res.status(500).json({ error: "Missing Stripe price configuration" });
+    }
+
+    let customerId = business.stripe_customer_id;
+
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: business.billing_email || undefined,
+        name: business.business_name || undefined,
+        metadata: {
+          business_id: business.id,
+          owner_user_id: userId,
+        },
+      });
+
+      customerId = customer.id;
+
+      await supabase
+        .from("businesses")
+        .update({ stripe_customer_id: customerId })
+        .eq("id", business.id);
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer: customerId,
+      line_items: [
+        {
+          price: priceId,
+          quantity: 1,
+        },
+      ],
+      success_url: `${process.env.APP_BASE_URL}/dashboard/billing?success=true`,
+      cancel_url: `${process.env.APP_BASE_URL}/dashboard/billing?canceled=true`,
+      metadata: {
+        business_id: business.id,
+        owner_user_id: userId,
+        plan_key: planKey,
+      },
+    });
+
+    return res.json({ url: session.url });
+  } catch (error) {
+    console.error("Create checkout session error:", error.message);
+    return res.status(500).json({ error: "Failed to create checkout session" });
   }
 });
 
